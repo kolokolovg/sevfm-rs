@@ -4,6 +4,6 @@ context: |
   Language: ru
   All artifacts must be written in ru.
   Keep OpenSpec structural headings and SHALL/MUST keywords in English.
-  Порт Java-версии (JavaFX, /home/gleb/dev/java/sevfm) на Rust + Slint:
-  поведение переносится без изменений, если иное не оговорено в change.
-  Java-тесты — источник edge-case'ов при переносе.
+  Настольный плеер онлайн-радио «Говорит Севастополь» на Rust + Slint.
+  Единственный источник поведения — спецификации openspec/specs
+  (плюс design.md активного change для инженерных решений).

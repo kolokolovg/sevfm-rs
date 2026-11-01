@@ -4,9 +4,25 @@ version = "0.1.0"
 edition = "2024"
 description = "Настольный плеер онлайн-радио «Говорит Севастополь»"
 license = "Apache-2.0"
-repository = "https://github.com/glebkolokolov/sevfm-rs"
+repository = "https://github.com/kolokolovg/sevfm-rs"
 authors = ["Gleb Kolokolov"]
 
-# Порт Java-версии (JavaFX) на Rust + Slint.
-# Фазы: аудио-тракт → сеть/ICY/буфер → UI (Slint) → трей → обложки → упаковка.
 [dependencies]
+# HTTP/TLS: синхронный, тело ответа — Read (стриминговое чтение), TLS —
+# rustls с корнями webpki. Только явные фичи: gzip отключён (design D1 —
+# радио-MP3 не сжимается, лишняя поверхность ни к чему), редиректы не
+# нужны (max_redirects(0) в коде). Фаза 1 читает чистый MP3, без ICY.
+ureq = { version = "3.5", default-features = false, features = ["rustls"] }
+# MP3-декодер: стриминговый probe → покадровый next_packet/decode (без Seek,
+# в отличие от rodio::Decoder). Включены только MP3 и SIMD-оптимизации.
+symphonia = { version = "0.6", default-features = false, features = ["mp3", "opt-simd"] }
+# Аудиовывод (rodio 0.23: DeviceSink + Player), конвертация формата
+# источника в формат устройства. Декодеры rodio не нужны — источник
+# сэмплов свой (pipeline.rs).
+rodio = { version = "0.23", default-features = false, features = ["playback"] }
+# SIGINT/SIGTERM → атомарный флаг остановки (feature termination добавляет SIGTERM).
+ctrlc = { version = "3.5", features = ["termination"] }
+# Ошибки: derive Display/Error для enum'ов ошибок. Только compile-time
+# (proc-macro), рантайм-зависимостей не добавляет; с фазой ICY число
+# enum'ов вырастет — бойлерплейт ручных impl держим под нулём.
+thiserror = "2"
