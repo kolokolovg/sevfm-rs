@@ -1,0 +1,12 @@
+[package]
+name = "sevfm"
+version = "0.1.0"
+edition = "2024"
+description = "Настольный плеер онлайн-радио «Говорит Севастополь»"
+license = "Apache-2.0"
+repository = "https://github.com/glebkolokolov/sevfm-rs"
+authors = ["Gleb Kolokolov"]
+
+# Порт Java-версии (JavaFX) на Rust + Slint.
+# Фазы: аудио-тракт → сеть/ICY/буфер → UI (Slint) → трей → обложки → упаковка.
+[dependencies]

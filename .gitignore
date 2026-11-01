@@ -1,0 +1,5 @@
+# Сборочные артефакты Cargo
+/target
+
+# Локальные environment-файлы
+.env
