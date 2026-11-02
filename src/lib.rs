@@ -20,6 +20,8 @@ pub mod buffer;
 pub mod icy;
 pub mod net;
 pub mod pipeline;
+pub mod session;
+pub mod ui;
 
 /// Пользовательское сообщение в stderr: по-русски, с префиксом `sevfm: `
 /// (конвенция проекта). Весь вывод для пользователя идёт через него —

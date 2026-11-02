@@ -1,0 +1,119 @@
+// Окно плеера (design D4 add-player-ui). Свойства и callbacks связывает
+// main.rs: poll-таймер пишет состояние, play()/stop() запускают и
+// останавливают сессию. Заглушка обложки — статичный квадрат: цепочка
+// подгрузки обложек (iTunes/Deezer/Яндекс + кеш) — отдельный future change.
+
+import { Button } from "std-widgets.slint";
+
+export component PlayerWindow inherits Window {
+    // Состояние из poll-таймера.
+    in-out property <string> station;
+    in-out property <string> status: "Остановлено";
+    in-out property <string> artist;
+    // `track-title`, а не `title`: title — собственное свойство Window
+    // (заголовок), переопределить его нельзя.
+    in-out property <string> track-title;
+    in-out property <string> error;
+    // Гейты кнопок из UiState: «Играть» — только из «Остановлено».
+    in-out property <bool> can-play: true;
+    in-out property <bool> can-stop: false;
+    // Управление воспроизведением.
+    callback play();
+    callback stop();
+
+    title: "Говорит Севастополь";
+    preferred-width: 440px;
+    preferred-height: 560px;
+    background: #14161d;
+
+    VerticalLayout {
+        padding: 24px;
+        spacing: 14px;
+
+        // Заглушка обложки.
+        Rectangle {
+            height: 210px;
+            border-radius: 14px;
+            background: #1e2230;
+            border-width: 1px;
+            border-color: #2a2f42;
+
+            Text {
+                text: "♪";
+                color: #4a5170;
+                font-size: 64px;
+            }
+        }
+
+        // Станция.
+        Text {
+            text: root.station == "" ? "—" : root.station;
+            color: #e8eaf2;
+            font-size: 22px;
+            font-weight: 700;
+            horizontal-stretch: 0;
+            overflow: elide;
+        }
+
+        // Статус.
+        Text {
+            text: root.status;
+            color: #8f97b8;
+            font-size: 15px;
+        }
+
+        // Трек: исполнитель и название; вставка без исполнителя — только
+        // название (строка исполнителя скрыта).
+        VerticalLayout {
+            spacing: 2px;
+
+            if root.artist != "": Text {
+                text: root.artist;
+                color: #c6cbde;
+                font-size: 16px;
+                overflow: elide;
+            }
+
+            if root.track-title != "": Text {
+                text: root.track-title;
+                color: #c6cbde;
+                font-size: 16px;
+                overflow: elide;
+            }
+        }
+
+        // Ошибка сессии (фатальная): показывается до следующего «Играть».
+        if root.error != "": Rectangle {
+            height: 44px;
+            border-radius: 8px;
+            background: #3a1f26;
+
+            Text {
+                text: root.error;
+                color: #f0a0b0;
+                font-size: 13px;
+                overflow: elide;
+            }
+        }
+
+        Rectangle { vertical-stretch: 1; }
+
+        // Управление: ровно два — «Играть» и «Стоп».
+        HorizontalLayout {
+            spacing: 12px;
+            alignment: center;
+
+            Button {
+                text: "Играть";
+                enabled: root.can-play;
+                clicked => { root.play(); }
+            }
+
+            Button {
+                text: "Стоп";
+                enabled: root.can-stop;
+                clicked => { root.stop(); }
+            }
+        }
+    }
+}

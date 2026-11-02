@@ -15,33 +15,37 @@
 //! sevfm — настольный плеер онлайн-радио «Говорит Севастополь»
 //! на Rust + Slint.
 //!
-//! Фаза 1 — тракт живого MP3-стрима: reader-поток → кольцевой буфер →
-//! покадровый декод → вывод PCM. Статусы и диагностика — в stderr.
-//! Использование: `sevfm [URL]` (без аргументов — станция по умолчанию).
-//! Остановка: Ctrl+C (SIGINT) или SIGTERM — код 0 в течение секунды.
+//! По умолчанию открывается окно (кнопки «Играть»/«Стоп», станция,
+//! статус, трек); флаг `--headless` сохраняет CLI-поведение: тракт
+//! сразу, статусы и эфир в stderr. Позиционный аргумент — URL потока
+//! (без него — станция по умолчанию). Остановка: «Стоп», закрытие
+//! окна, Ctrl+C (SIGINT) или SIGTERM — код 0 в течение секунды.
 
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use sevfm::buffer::RingBuffer;
-use sevfm::icy::{SharedNowPlaying, TrackInfo};
-use sevfm::net::{
-    self, GarbageBudget, Link, NetStatus, PlaybackStatus, SharedNetStatus, playback_status,
-};
-use sevfm::pipeline::{DEFAULT_STREAM_URL, Mp3Source, Outcome, SharedOutcome};
+use sevfm::icy::TrackInfo;
+use sevfm::net::{PlaybackStatus, playback_status};
+use sevfm::session::{PlayerSession, SessionHandle, SessionOutcome};
+use sevfm::ui::{PlayerView, TrackSlot, UiState, parse_args};
 use sevfm::{redact_url, say};
 
-/// Интервал опроса флага остановки и статусов.
+slint::include_modules!();
+
+/// Интервал опроса сессии (poll-таймер окна и цикл статусов headless) —
+/// тот же ритм, что такт воркера сессии.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Код выхода при ошибке запуска тракта или сбое живого цикла
 /// (спека: 0 — штатная остановка, 2 — неуспех).
 const EXIT_FAILURE: i32 = 2;
+/// Сторожевая граница join воркера после выхода из цикла событий:
+/// закрытие окна и сигнал обязаны давать код 0 ≤ 1 с (спека player-ui).
+const JOIN_DEADLINE: Duration = Duration::from_secs(1);
 
-/// Печать эфира с дедупликацией (design D5 фазы ICY): станция — один
-/// раз при первом появлении, трек — при каждой смене. Опрашивается из
-/// циклов статусов; будущий UI заменит печать, тракт не меняется.
+/// Печать эфира с дедупликацией (design D5 фазы ICY, headless-режим):
+/// станция — один раз при первом появлении, трек — при каждой смене.
 struct NowPlayingPrinter {
     station_shown: bool,
     last_track: Option<TrackInfo>,
@@ -55,67 +59,121 @@ impl NowPlayingPrinter {
         }
     }
 
-    fn poll(&mut self, slot: &SharedNowPlaying) {
-        // Копия печатаемого под замком; say() — после drop'а замка:
-        // блокирующая печать (худший пайп) не держит reader в
-        // Meta-callback.
-        let (new_station, new_track) = {
-            let ether = slot
-                .lock()
-                .expect("замок эфира не отравлен: присваивание не паникует");
-            (
-                (!self.station_shown)
-                    .then(|| ether.station.clone())
-                    .flatten(),
-                (ether.track != self.last_track)
-                    .then(|| ether.track.clone())
-                    .flatten(),
-            )
-        };
-        if let Some(station) = new_station {
+    fn poll(&mut self, station: &Option<String>, track: &Option<TrackInfo>) {
+        if !self.station_shown
+            && let Some(station) = station
+        {
             say(&format!("станция: {station}"));
             self.station_shown = true;
         }
-        if let Some(track) = new_track {
+        // None-трек — «нет данных», не переход: печать только на смену
+        // реального трека.
+        if track != &self.last_track
+            && let Some(track) = track
+        {
             say(&format!("сейчас в эфире: {}", track.display()));
-            self.last_track = Some(track);
+            self.last_track = Some(track.clone());
         }
     }
 }
+
+/// Связка окна и сессий (design D3/D4 add-player-ui): живёт под
+/// `Arc<Mutex>` — её трогают poll-таймер, callback'и окна и обработчик
+/// сигнала, все секции короткие.
+struct UiBinding {
+    url: String,
+    process_stop: Arc<AtomicBool>,
+    session: Option<SessionHandle>,
+    view: PlayerView,
+}
+
+impl UiBinding {
+    fn new(url: String, process_stop: Arc<AtomicBool>) -> Self {
+        Self {
+            url,
+            process_stop,
+            session: None,
+            view: PlayerView::new(),
+        }
+    }
+}
+
+/// Разделяемая связка для таймера и обработчиков.
+type SharedUiBinding = Arc<Mutex<UiBinding>>;
 
 fn main() {
     std::process::exit(run());
 }
 
-/// Коды выхода: 0 — штатная остановка (сигнал или конец потока),
-/// 2 — ошибка запуска тракта (нет аудиоустройства, поток не MP3) или
-/// сбой живого цикла (ошибка декодера, аварийное завершение reader'а).
+/// Коды выхода: 0 — штатная остановка (сигнал, закрытие окна или конец
+/// потока), 2 — ошибка аргументов, запуска тракта (нет аудиоустройства,
+/// поток не MP3) или сбой живого цикла.
 fn run() -> i32 {
-    // CLI: URL из аргумента, по умолчанию — адрес станции. args_os вместо
-    // args: невалидный UTF-8 не паникует, lossy-конверсии достаточно
-    // (URL с U+FFFD просто не подключится с внятной диагностикой).
-    let url = std::env::args_os()
-        .nth(1)
-        .map(|a| a.to_string_lossy().into_owned())
-        .unwrap_or_else(|| DEFAULT_STREAM_URL.to_owned());
+    let launch = match parse_args(std::env::args_os().skip(1)) {
+        Ok(launch) => launch,
+        Err(message) => {
+            say(&message);
+            return EXIT_FAILURE;
+        }
+    };
 
-    // SIGINT/SIGTERM → атомарный флаг. Порядок SeqCst во всех точках
-    // (запись из обработчика сигнала, чтение из потоков тракта).
-    let stop = Arc::new(AtomicBool::new(false));
+    // Флаг завершения процесса — головной стоп для любой сессии:
+    // в headless его ставит сигнал (плюс сторож выхода), в UI — сигнал
+    // дублирует им прямой stop активной сессии.
+    let process_stop = Arc::new(AtomicBool::new(false));
+    let binding: SharedUiBinding = Arc::new(Mutex::new(UiBinding::new(
+        launch.url.clone(),
+        process_stop.clone(),
+    )));
+
+    // Обработчик сигнала — один на процесс (ограничение крейта), ставится
+    // до ветвления режимов (design D5). Действие выбирается по режиму:
+    // headless — только флаг (дальше сторож), UI — стоп активной сессии
+    // и выход из цикла событий.
+    let ui_mode = !launch.headless;
     if ctrlc::set_handler({
-        let stop = stop.clone();
-        move || stop.store(true, Ordering::SeqCst)
+        let process_stop = process_stop.clone();
+        let binding = binding.clone();
+        move || {
+            process_stop.store(true, Ordering::SeqCst);
+            if ui_mode {
+                // Паника в обработчике сигнала недопустима: отравленный
+                // замок не должен мешать главному действию — выходу из
+                // цикла событий.
+                if let Ok(ui) = binding.lock()
+                    && let Some(session) = ui.session.as_ref()
+                {
+                    session.stop();
+                }
+                // Разрешён из любого потока; ошибка «цикл не запущен или
+                // уже завершён» не важна — окно закрывается и само.
+                let _ = slint::quit_event_loop();
+            }
+        }
     })
     .is_err()
     {
         say("не удалось установить обработчик сигнала");
         return EXIT_FAILURE;
     }
+
+    if launch.headless {
+        run_headless(&launch.url, &process_stop)
+    } else {
+        run_ui(&binding, &process_stop)
+    }
+}
+
+/// CLI-режим (`--headless`): тракт сразу, статусы и эфир в stderr.
+///
+/// Коды выхода: 0 — штатная остановка (сигнал или конец потока),
+/// 2 — ошибка запуска тракта или сбой живого цикла.
+fn run_headless(url: &str, process_stop: &Arc<AtomicBool>) -> i32 {
     // Сторож выхода: сигнал может прийти, когда главный поток заблокирован
     // (ожидание данных, декодирование) — выход делаем сразу, без
     // drop/join аудио-потоков (design D5: ресурсы освобождает процесс).
     {
-        let stop = stop.clone();
+        let stop = process_stop.clone();
         std::thread::spawn(move || {
             while !stop.load(Ordering::SeqCst) {
                 std::thread::sleep(POLL_INTERVAL);
@@ -125,189 +183,228 @@ fn run() -> i32 {
         });
     }
 
-    // Тракт: reader-поток наполняет кольцевой буфер, декодер читает
-    // из него — воспроизведение не из сети (design D4). Link — связка
-    // reader ↔ декодер (мусорный лимит → переподключение, эпоха
-    // соединений); слот исхода — финальная классификация кода выхода.
-    say(&format!("подключение к {}…", redact_url(&url)));
-    let buffer = RingBuffer::phase1();
-    let budget = GarbageBudget::shared();
-    let link = Link::shared();
-    let outcome_slot: SharedOutcome = Arc::new(Mutex::new(Outcome::Running));
-    let net_status: SharedNetStatus = Arc::new(Mutex::new(NetStatus::Connecting));
-    // Эфир (станция из icy-name, трек из StreamTitle) — тем же паттерном
-    // разделяемого слота, что и сетевой статус.
-    let now_playing: SharedNowPlaying = Default::default();
-    // Хэндл потока не храним: паника reader'а видна через флаг в Link
-    // (catch_unwind), нормальный выход потока без остановки в живом
-    // тракте невозможен.
-    if let Err(e) = net::spawn_reader(
-        url,
-        buffer.clone(),
-        stop.clone(),
-        budget.clone(),
-        link.clone(),
-        net_status.clone(),
-        now_playing.clone(),
-    ) {
-        say(&format!("не удалось запустить поток чтения: {e}"));
-        return EXIT_FAILURE;
-    }
+    say(&format!("подключение к {}…", redact_url(url)));
+    let mut session = match PlayerSession::start(url.to_owned(), process_stop.clone()) {
+        Ok(session) => session,
+        Err(e) => {
+            say(&format!("не удалось запустить поток чтения: {e}"));
+            return EXIT_FAILURE;
+        }
+    };
 
-    // Предбуферизация: старт декодирования после накопления начального
-    // объёма данных (спека о непрерывности). Сетевые ретраи первого
-    // соединения здесь же — выход только по сигналу. Станция и первый
-    // трек видны уже здесь: метаданные приходят с первыми байтами.
+    // Статус — по переходам: «Подключение» предсеяно (строка подключения
+    // уже напечатана); станция и первый трек видны уже в фазе предбуфера —
+    // метаданные приходят с первыми байтами.
     let mut ether_printer = NowPlayingPrinter::new();
-    while !stop.load(Ordering::SeqCst) && !buffer.is_prebuffered() {
-        ether_printer.poll(&now_playing);
-        if link.reader_panicked() {
-            // Паника reader'а до предбуфера (catch_unwind уже закрыл буфер
-            // и напечатал диагностику): данных больше не будет.
-            say("поток чтения завершился до накопления предбуфера");
-            return EXIT_FAILURE;
-        }
-        if link.fatal() {
-            // Сервер отклонил запрос перманентно (HTTP 3xx/4xx): reader
-            // завершился, повторные попытки бессмысленны.
-            say("подключение отклонено сервером");
-            return EXIT_FAILURE;
-        }
-        std::thread::sleep(POLL_INTERVAL);
-    }
-    if stop.load(Ordering::SeqCst) {
-        return 0;
-    }
-
-    let source = match Mp3Source::new(
-        buffer.clone(),
-        budget,
-        stop.clone(),
-        link.clone(),
-        outcome_slot.clone(),
-    ) {
-        Ok(source) => source,
-        Err(e) => {
-            // Сигнал во время построения тракта — остановка (код 0),
-            // а не ошибка старта.
-            if stop.load(Ordering::SeqCst) {
-                return 0;
-            }
-            say(&e.to_string());
-            return EXIT_FAILURE;
-        }
-    };
-    let (rate, channels) = source.spec();
-    say(&format!("поток: MP3, {rate} Гц, {channels} кан."));
-
-    // Вывод: устройство по умолчанию; Player сам конвертирует формат
-    // источника в формат устройства — «параметры из потока» (спека).
-    // Гибель потока вывода (устройство отключили, ошибка драйвера)
-    // наблюдаем error-callback'ом cpal: без наблюдателя Player::empty
-    // на мёртвом потоке не опустеет — CLI завис бы с тишиной.
-    let audio_crashed = Arc::new(AtomicBool::new(false));
-    let mut device_sink = match open_output_device(&audio_crashed) {
-        Ok(device_sink) => device_sink,
-        Err(e) => {
-            say(&format!("аудиоустройство недоступно: {e}"));
-            return EXIT_FAILURE;
-        }
-    };
-    // Штатный выход сопровождаем своими строками; предупреждение rodio
-    // при drop устройства не нужно.
-    device_sink.log_on_drop(false);
-    let player = rodio::Player::connect_new(device_sink.mixer());
-    player.append(source);
-
-    // Ждём конца потока (сигнал обслуживает сторож): статус выводится
-    // по переходам — Подключение уже напечатан, дальше живой цикл.
     let mut last_status = Some(PlaybackStatus::Connecting);
-    while !player.empty() {
-        if audio_crashed.load(Ordering::SeqCst) {
-            // Поток вывода умер: источник больше никем не опрашивается,
-            // empty() не опустеет — выходим и классифицируем как аварию.
-            break;
-        }
-        if link.reader_panicked() {
-            // Паника reader'а в живом цикле (catch_unwind закрыл буфер —
-            // тракт дочитает и опустеет, но исход уже не штатный).
-            break;
-        }
-        let net = *net_status
-            .lock()
-            .expect("замок статуса не отравлен: присваивание не паникует");
-        // Живой цикл: воспроизведение уже запущено; пауза — точный флаг
-        // underrun декодера, а не «буфер пуст» (звук идёт и на низком
-        // уровне заполнения).
-        let status = playback_status(net, true, buffer.is_underrun());
+    while session.is_running() {
+        let tick = session.tick();
+        ether_printer.poll(&tick.station, &tick.track);
+        // Живой цикл: пауза — точный флаг underrun декодера, а не «буфер
+        // пуст» (звук идёт и на низком уровне заполнения).
+        let status = playback_status(tick.net, tick.playback_started, tick.underrun);
         if last_status != Some(status) {
             say(&format!("состояние: {}", status.label()));
             last_status = Some(status);
         }
-        ether_printer.poll(&now_playing);
         std::thread::sleep(POLL_INTERVAL);
     }
 
-    player.stop();
-    drop(device_sink); // освобождаем аудиоустройство
-
-    // Классификация исхода: паника reader'а, гибель потока вывода или
-    // ошибка декодера вне остановки — неуспех (код 2); сигнал и штатный
-    // конец — 0. Running недостижим: источник отдаёт None только после
-    // фиксации исхода. Сигнал проверяем после аварийных флагов — спека
-    // требует код 0, даже если события совпали.
-    if link.fatal() && !stop.load(Ordering::SeqCst) {
-        say("подключение отклонено сервером");
-        return EXIT_FAILURE;
-    }
-    if link.reader_panicked() && !stop.load(Ordering::SeqCst) {
-        say("поток чтения завершился аварийно");
-        return EXIT_FAILURE;
-    }
-    if audio_crashed.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) {
-        // Гибель потока вывода (error-callback cpal) — не штатный конец:
-        // авария тракта, код 2, а не молчаливый зависший процесс.
-        say("поток вывода аварийно завершился (аудиоустройство)");
-        return EXIT_FAILURE;
-    }
-    match *outcome_slot
-        .lock()
-        .expect("замок исхода не отравлен: присваивание не паникует")
-    {
-        Outcome::DecoderError => {
-            say("воспроизведение прервано ошибкой тракта");
+    // Классификация исхода — в сессии (порядок и сообщения прежнего
+    // `run()`): Fatal → диагностика и код 2, Stopped → 0.
+    match session.join() {
+        SessionOutcome::Stopped => 0,
+        SessionOutcome::Fatal(message) => {
+            say(&message);
             EXIT_FAILURE
         }
-        _ => 0,
     }
 }
 
-/// Открывает вывод на устройстве по умолчанию с наблюдателем гибели
-/// аудио-потока: error-callback cpal поднимает `crashed` (устройство
-/// отключили, ошибка драйвера) — CLI обязан завершиться с кодом 2, а не
-/// ждать `Player::empty`, который на мёртвом потоке не опустеет.
-///
-/// Основной путь не перебирает конфигурации и устройства; при неудаче
-/// откатываемся на `open_default_sink` rodio (там наблюдателя поставить
-/// нельзя) — авария вывода в запасном пути видна только как пропавший
-/// звук, лучше чем отказ в запуске на нестандартных конфигурациях.
-/// Обе неудачи — комбинированная диагностика: первичная ошибка не
-/// глотается вторичной.
-fn open_output_device(crashed: &Arc<AtomicBool>) -> Result<rodio::MixerDeviceSink, String> {
-    let watched = rodio::DeviceSinkBuilder::from_default_device().and_then(|builder| {
-        builder
-            .with_error_callback({
-                let crashed = crashed.clone();
-                move |_error| crashed.store(true, Ordering::SeqCst)
+/// Режим окна по умолчанию: окно в «Остановлено», тракт — по «Играть».
+fn run_ui(binding: &SharedUiBinding, process_stop: &Arc<AtomicBool>) -> i32 {
+    let window = match PlayerWindow::new() {
+        Ok(window) => window,
+        Err(e) => {
+            say(&format!("не удалось открыть окно: {e}"));
+            return EXIT_FAILURE;
+        }
+    };
+    window.set_status(UiState::Stopped.label().into());
+    window.set_can_play(true);
+    window.set_can_stop(false);
+
+    // «Играть»: новая сессия только из «Остановлено» — гейт can-play
+    // отпускает кнопку по факту завершения воркера (design: teardown
+    // ~100–300 мс, следующая сессия стартует только на мёртвом воркере —
+    // без гонки за аудиоустройство); здесь защита от клика, опередившего
+    // таймер.
+    {
+        let binding = binding.clone();
+        let weak = window.as_weak();
+        window.on_play(move || {
+            let Some(window) = weak.upgrade() else { return };
+            let Ok(mut ui) = binding.lock() else { return };
+            if ui
+                .session
+                .as_ref()
+                .is_some_and(|session| session.is_running())
+            {
+                return;
+            }
+            // Мёртвый воркер прошлой сессии: подбираем поток (мгновенно).
+            if let Some(mut old) = ui.session.take() {
+                old.join();
+            }
+            match PlayerSession::start(ui.url.clone(), ui.process_stop.clone()) {
+                Ok(session) => {
+                    say("играть: запуск сессии");
+                    ui.session = Some(session);
+                    ui.view.reset();
+                    // Поля прошлой сессии не имеют отношения к новой:
+                    // статус и гейты обновит ближайший poll-такт.
+                    window.set_station("".into());
+                    window.set_artist("".into());
+                    window.set_track_title("".into());
+                    window.set_error("".into());
+                }
+                Err(e) => {
+                    window.set_error(format!("не удалось запустить поток чтения: {e}").into());
+                }
+            }
+        });
+    }
+
+    // «Стоп»: флаг остановки сессии — воркер глушит вывод и освобождает
+    // устройство за такт опроса, статус уходит в «Остановлено» по факту
+    // завершения воркера (ближайший poll-такт).
+    {
+        let binding = binding.clone();
+        window.on_stop(move || {
+            if let Ok(ui) = binding.lock()
+                && let Some(session) = ui.session.as_ref()
+            {
+                say("стоп: остановка сессии");
+                session.stop();
+            }
+        });
+    }
+
+    // Poll-таймер (design D3): создаётся в главном потоке (ограничение
+    // Slint — поток, не факт запуска цикла) и живёт до конца run_ui —
+    // drop таймера глушит его. Читает слоты сессии, прогоняет модель
+    // окна с дедупликацией и пишет только изменения.
+    let timer = slint::Timer::default();
+    {
+        let binding = binding.clone();
+        let weak = window.as_weak();
+        let process_stop = process_stop.clone();
+        timer.start(slint::TimerMode::Repeated, POLL_INTERVAL, move || {
+            // Сигнал до старта цикла терял quit_event_loop (Slint не
+            // латчит запрос без цикла — NoEventLoopProvider): повторяем
+            // выход по флагу из первого же тика.
+            if process_stop.load(Ordering::SeqCst) {
+                let _ = slint::quit_event_loop();
+            }
+            let Some(window) = weak.upgrade() else { return };
+            let Ok(mut ui) = binding.lock() else { return };
+            let Some(session) = ui.session.as_ref() else {
+                return;
+            };
+            let tick = session.tick();
+            let update = ui.view.poll(&tick);
+            if let Some(station) = update.station {
+                window.set_station(station.unwrap_or_default().into());
+            }
+            if let Some(slot) = update.track {
+                // Трек-строка (правило чек-листа 4.3): трек — исполнитель
+                // и название; сырой StreamTitle — только название;
+                // заглушка — название станции (без станции строка пуста
+                // и скрыта разметкой).
+                let (artist, title) = match slot {
+                    TrackSlot::Track { artist, title } => (artist, title),
+                    TrackSlot::Title { title } => (String::new(), title),
+                    TrackSlot::Placeholder { station } => {
+                        (String::new(), station.unwrap_or_default())
+                    }
+                };
+                window.set_artist(artist.into());
+                window.set_track_title(title.into());
+            }
+            if let Some(status) = update.status {
+                window.set_status(status.label().into());
+                window.set_can_play(status == UiState::Stopped);
+                window.set_can_stop(status != UiState::Stopped);
+                // Исход сессии — в stderr: ошибки в окне мимолётны, а
+                // таймлайн Играть/Стоп/ошибка нужен и в логе.
+                if status == UiState::Stopped
+                    && let Some(outcome) = &tick.outcome
+                {
+                    match outcome {
+                        SessionOutcome::Stopped => say("сессия завершена: остановлено"),
+                        SessionOutcome::Fatal(message) => {
+                            say(&format!("сессия завершена: ошибка — {message}"));
+                        }
+                    }
+                }
+            }
+            if let Some(error) = update.error {
+                window.set_error(error.into());
+            }
+            // Смена эфира из потока — в stderr: вставка в окне видна
+            // заглушкой, но в логе смена метаданных обязана быть видна.
+            if let Some(ether) = update.ether {
+                match ether {
+                    TrackInfo::Track { artist, title } => {
+                        say(&format!("эфир: {artist} — {title}"));
+                    }
+                    TrackInfo::Insert { title } => {
+                        say(&format!("эфир: вставка ({title}) — в окне заглушка"));
+                    }
+                    TrackInfo::Raw { title } => {
+                        say(&format!("эфир: {title}"));
+                    }
+                }
+            }
+        });
+    }
+
+    let event_loop = window.run();
+    drop(timer);
+
+    // Разбор после цикла событий (закрытие окна или сигнал): остановка
+    // сессии и join воркера со сторожем-страховкой — гарантия «код 0
+    // ≤ 1 с» (design D5), как сторож headless. Отравленный замок не
+    // отменяет разбор: данных связки достаточно и из отравленного
+    // состояния (паника в коллбеке уже напечатана хуком), а выходить
+    // здесь надо всегда — иначе сессия переживёт закрытие окна.
+    let mut ui = binding
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(session) = ui.session.as_mut() {
+        session.stop();
+        let joined = Arc::new(AtomicBool::new(false));
+        let watchdog = {
+            let joined = joined.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(JOIN_DEADLINE);
+                // Join завис — выходим напрямую, ресурсы освободит
+                // процесс; код 0 даже в этой аномалии (спека).
+                if !joined.load(Ordering::SeqCst) {
+                    std::process::exit(0);
+                }
             })
-            .open_stream()
-    });
-    match watched {
-        Ok(sink) => Ok(sink),
-        Err(primary) => rodio::DeviceSinkBuilder::open_default_sink().map_err(|fallback| {
-            format!(
-                "первичная ошибка открытия вывода: {primary}; перебор устройств rodio: {fallback}"
-            )
-        }),
+        };
+        session.join();
+        joined.store(true, Ordering::SeqCst);
+        drop(watchdog); // поток отвязан: главный выход завершит его
+    }
+
+    match event_loop {
+        Ok(()) => 0,
+        Err(e) => {
+            say(&format!("цикл событий завершён с ошибкой: {e}"));
+            EXIT_FAILURE
+        }
     }
 }

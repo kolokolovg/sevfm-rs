@@ -351,8 +351,9 @@ impl Link {
     }
 
     /// Reader: сервер отклонил запрос перманентно (HTTP 3xx/4xx) —
-    /// повторные попытки бессмысленны.
-    fn mark_fatal(&self) {
+    /// повторные попытки бессмысленны. pub(crate) — юнит-тесты сессии
+    /// моделируют отказ сервера этим же флагом.
+    pub(crate) fn mark_fatal(&self) {
         self.fatal.store(true, Ordering::Relaxed);
     }
 

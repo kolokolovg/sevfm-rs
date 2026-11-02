@@ -15,6 +15,8 @@
 //! Остановка по сигналу на молчащем сервере без сети и аудиоустройства
 //! (задача 4.2): процесс ждёт данные, SIGINT завершает его кодом 0
 //! за секунду — сторож выходит напрямую, без drop/join аудио-потоков.
+//! Запуск с `--headless` (задача 4.1 add-player-ui): без флага бинарник
+//! открывает окно.
 
 mod common;
 
@@ -29,6 +31,7 @@ fn sigint_on_silent_server_exits_zero_within_second() {
     let mut server = MockServer::start(vec![Scenario::silence()]);
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_sevfm"))
+        .arg("--headless")
         .arg(server.url())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

@@ -648,8 +648,8 @@ fn icy_blocks_are_stripped_and_track_updates() {
         assert_eq!(ether.station.as_deref(), Some("Говорит Севастополь"));
         assert_eq!(
             ether.track,
-            Some(TrackInfo {
-                artist: Some("ВЛАДИМИР ТРОШИН".to_owned()),
+            Some(TrackInfo::Track {
+                artist: "ВЛАДИМИР ТРОШИН".to_owned(),
                 title: "ЮНОСТЬ МОЯ".to_owned(),
             })
         );
@@ -707,8 +707,7 @@ fn icy_track_changes_with_blocks() {
         .lock()
         .expect("замок эфира не отравлен: присваивание не паникует")
         .track
-        != Some(TrackInfo {
-            artist: None,
+        != Some(TrackInfo::Raw {
             title: "Реклама".to_owned(),
         })
     {
@@ -864,8 +863,8 @@ fn reconnect_reframes_icy_stream() {
     // Трек второго соединения может дойти до слота позже последнего
     // байта буфера: поллим до нужного TrackInfo с дедлайном (образец —
     // icy_track_changes_with_blocks).
-    let expected_track = Some(TrackInfo {
-        artist: Some("ИСПОЛНИТЕЛЬ".to_owned()),
+    let expected_track = Some(TrackInfo::Track {
+        artist: "ИСПОЛНИТЕЛЬ".to_owned(),
         title: "ВТОРОЙ ТРЕК".to_owned(),
     });
     while now_playing
@@ -880,10 +879,15 @@ fn reconnect_reframes_icy_stream() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
-    let ether = now_playing
-        .lock()
-        .expect("замок эфира не отравлен: присваивание не паникует");
-    assert_eq!(ether.station.as_deref(), Some("Говорит Севастополь"));
+    // Guard в блоке: именованная привязка живёт до конца функции и
+    // удерживала бы замок эфира через stop/join — а reader'у нужен он
+    // в Meta-callback, получался дедлок (паттерн соседних тестов выше).
+    {
+        let ether = now_playing
+            .lock()
+            .expect("замок эфира не отравлен: присваивание не паникует");
+        assert_eq!(ether.station.as_deref(), Some("Говорит Севастополь"));
+    }
 
     stop.store(true, Ordering::SeqCst);
     reader.join().expect("reader завершается по флагу");

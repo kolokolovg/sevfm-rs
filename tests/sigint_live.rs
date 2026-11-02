@@ -14,7 +14,8 @@
 
 //! Живой тест остановки по сигналу (задача 4.2): запуск бинарника
 //! на живом потоке, SIGINT — процесс завершается кодом 0 не дольше
-//! чем за 1 с (требование спеки об остановке).
+//! чем за 1 с (требование спеки об остановке). Запуск с `--headless`
+//! (задача 4.1 add-player-ui): без флага бинарник открывает окно.
 //!
 //! Запуск: `cargo test --test sigint_live -- --ignored`.
 
@@ -28,6 +29,7 @@ use sevfm::pipeline::DEFAULT_STREAM_URL;
 #[ignore = "живой тест: требует сеть и аудиоустройство"]
 fn sigint_stops_playback_with_zero_exit_code() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_sevfm"))
+        .arg("--headless")
         .arg(DEFAULT_STREAM_URL)
         .stdout(Stdio::null())
         .stderr(Stdio::null())

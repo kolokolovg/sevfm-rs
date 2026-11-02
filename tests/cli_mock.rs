@@ -14,7 +14,8 @@
 
 //! Коды выхода бинарника на мок-сервере (задача 4.3): поток не MP3 —
 //! код 2 с диагностикой; недоступный сервер — бесконечные ретраи с логом
-//! в stderr и выход только по сигналу с кодом 0.
+//! в stderr и выход только по сигналу с кодом 0. Запуск с `--headless`
+//! (задача 4.1 add-player-ui): без флага бинарник открывает окно.
 
 mod common;
 
@@ -32,6 +33,7 @@ fn non_mp3_stream_exits_with_code_2() {
     let mut server = MockServer::start(vec![Scenario::non_mp3()]);
 
     let output = Command::new(env!("CARGO_BIN_EXE_sevfm"))
+        .arg("--headless")
         .arg(server.url())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -64,6 +66,7 @@ fn endless_garbage_stream_exits_with_code_2() {
     let mut server = MockServer::start(vec![Scenario::garbage_forever(Vec::new())]);
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_sevfm"))
+        .arg("--headless")
         .arg(server.url())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -111,6 +114,7 @@ fn unreachable_server_retries_forever_then_signal_exits_zero() {
     drop(probe);
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_sevfm"))
+        .arg("--headless")
         .arg(&dead_url)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -155,6 +159,7 @@ fn permanent_status_exits_with_code_2() {
     let mut server = MockServer::start(vec![Scenario::status(404)]);
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_sevfm"))
+        .arg("--headless")
         .arg(server.url())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -217,6 +222,7 @@ fn icy_metadata_printed_to_stderr() {
     )]);
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_sevfm"))
+        .arg("--headless")
         .arg(server.url())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

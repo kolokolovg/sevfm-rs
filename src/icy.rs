@@ -129,23 +129,37 @@ impl IcyFramer {
     }
 }
 
-/// Разобранный трек из `StreamTitle`.
+/// Разобранный трек из `StreamTitle`. Вставка (реклама/новости)
+/// отличается от трека: окно показывает её заглушкой, а не названием
+/// (спека player-ui — правило «трек виден только при воспроизведении»);
+/// stderr-представление у обоих — название.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct TrackInfo {
-    /// Исполнитель: None — вставка (реклама/новости) или трек без
-    /// исполнителя.
-    pub artist: Option<String>,
-    /// Название трека (или вся строка `StreamTitle`, если JSON не
-    /// распознан).
-    pub title: String,
+pub enum TrackInfo {
+    /// Трек: исполнитель и название.
+    Track { artist: String, title: String },
+    /// Вставка (реклама/новости): пустой исполнитель или тип ≠ «М».
+    Insert { title: String },
+    /// `StreamTitle` без распознанного JSON: вся строка — название,
+    /// показывается как трек без исполнителя.
+    Raw { title: String },
 }
 
 impl TrackInfo {
-    /// Строка для пользователя: «АРТИСТ — НАЗВАНИЕ» или просто название.
+    /// Название (у всех видов трека).
+    pub fn title(&self) -> &str {
+        match self {
+            TrackInfo::Track { title, .. }
+            | TrackInfo::Insert { title }
+            | TrackInfo::Raw { title } => title,
+        }
+    }
+
+    /// Строка для пользователя (stderr): «АРТИСТ — НАЗВАНИЕ» или просто
+    /// название.
     pub fn display(&self) -> String {
-        match &self.artist {
-            Some(artist) => format!("{artist} — {}", self.title),
-            None => self.title.clone(),
+        match self {
+            TrackInfo::Track { artist, title } => format!("{artist} — {title}"),
+            TrackInfo::Insert { title } | TrackInfo::Raw { title } => title.clone(),
         }
     }
 }
@@ -182,8 +196,7 @@ pub(crate) fn parse_meta(block: &[u8]) -> Option<TrackInfo> {
     // как название, как при провале разбора.
     match track.filter(|json| json.is_object()) {
         Some(json) => track_from_json(&json),
-        None => Some(TrackInfo {
-            artist: None,
+        None => Some(TrackInfo::Raw {
             title: raw.into_owned(),
         }),
     }
@@ -207,9 +220,15 @@ fn track_from_json(json: &serde_json::Value) -> Option<TrackInfo> {
     // «М» — по спеке icy-metadata.
     const TRACK_TYPE_MUSIC: &str = "М";
     let is_track = !artist.is_empty() && kind.is_none_or(|k| k == TRACK_TYPE_MUSIC);
-    Some(TrackInfo {
-        artist: is_track.then(|| artist.to_owned()),
-        title: name.to_owned(),
+    Some(if is_track {
+        TrackInfo::Track {
+            artist: artist.to_owned(),
+            title: name.to_owned(),
+        }
+    } else {
+        TrackInfo::Insert {
+            title: name.to_owned(),
+        }
     })
 }
 
@@ -357,11 +376,18 @@ mod tests {
     }
 
     /// Таблица StreamTitle: JSON-трек, строка, обрезанный JSON, вставки,
-    /// экранирование, мусор (design D3, задачи 1.2).
+    /// экранирование, мусор (design D3, задачи 1.2; правило заглушек
+    /// player-ui — вставка различается с треком и сырой строкой).
     #[test]
     fn parse_meta_table() {
-        let track = |artist: Option<&str>, title: &str| TrackInfo {
-            artist: artist.map(str::to_owned),
+        let track = |artist: &str, title: &str| TrackInfo::Track {
+            artist: artist.to_owned(),
+            title: title.to_owned(),
+        };
+        let insert = |title: &str| TrackInfo::Insert {
+            title: title.to_owned(),
+        };
+        let raw = |title: &str| TrackInfo::Raw {
             title: title.to_owned(),
         };
 
@@ -370,48 +396,45 @@ mod tests {
             parse_meta(&meta_block(
                 "{\"artist\":\"ВЛАДИМИР ТРОШИН\",\"name\":\"ЮНОСТЬ МОЯ\"}"
             )),
-            Some(track(Some("ВЛАДИМИР ТРОШИН"), "ЮНОСТЬ МОЯ"))
+            Some(track("ВЛАДИМИР ТРОШИН", "ЮНОСТЬ МОЯ"))
         );
         // JSON с type «М» — музыкальный трек.
         assert_eq!(
             parse_meta(&meta_block(
                 "{\"artist\":\"ИСПОЛНИТЕЛЬ\",\"name\":\"ТРЕК\",\"type\":\"М\"}"
             )),
-            Some(track(Some("ИСПОЛНИТЕЛЬ"), "ТРЕК"))
+            Some(track("ИСПОЛНИТЕЛЬ", "ТРЕК"))
         );
-        // Вставка: пустой artist, type «Д» — только название.
+        // Вставка: пустой artist, type «Д».
         assert_eq!(
             parse_meta(&meta_block(
                 "{\"artist\":\"\",\"duration\":\"\",\"name\":\"Говорит Севастополь\",\"type\":\"Д\"}"
             )),
-            Some(track(None, "Говорит Севастополь"))
+            Some(insert("Говорит Севастополь"))
         );
         // Вставка по одному type ≠ «М» (artist непустой).
         assert_eq!(
             parse_meta(&meta_block(
                 "{\"artist\":\"Х\",\"name\":\"НОВОСТИ\",\"type\":\"Н\"}"
             )),
-            Some(track(None, "НОВОСТИ"))
+            Some(insert("НОВОСТИ"))
         );
         // Без JSON — вся строка как название.
-        assert_eq!(
-            parse_meta(&meta_block("Реклама")),
-            Some(track(None, "Реклама"))
-        );
+        assert_eq!(parse_meta(&meta_block("Реклама")), Some(raw("Реклама")));
         // Обрезанный JSON — сырая строка, без краха.
         assert_eq!(
             parse_meta(&meta_block("{\"artist\":\"ВЛАДИМИР")),
-            Some(track(None, "{\"artist\":\"ВЛАДИМИР"))
+            Some(raw("{\"artist\":\"ВЛАДИМИР"))
         );
         // Экранированная кавычка '' внутри значения.
         assert_eq!(
             parse_meta(&meta_block("It''s fine")),
-            Some(track(None, "It's fine"))
+            Some(raw("It's fine"))
         );
         // Валидный JSON-скаляр — не объект: сырая строка как название
         // (спека icy-metadata).
-        assert_eq!(parse_meta(&meta_block("42")), Some(track(None, "42")));
-        assert_eq!(parse_meta(&meta_block("true")), Some(track(None, "true")));
+        assert_eq!(parse_meta(&meta_block("42")), Some(raw("42")));
+        assert_eq!(parse_meta(&meta_block("true")), Some(raw("true")));
         // Пустой StreamTitle — нечего показывать.
         assert_eq!(parse_meta(&meta_block("")), None);
         // Мусорный блок без StreamTitle и JSON без name — игнор.
