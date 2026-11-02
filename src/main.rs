@@ -26,6 +26,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use sevfm::cover::{CoverImage, CoverReply, Covers};
 use sevfm::icy::TrackInfo;
 use sevfm::net::{PlaybackStatus, playback_status};
 use sevfm::session::{PlayerSession, SessionHandle, SessionOutcome};
@@ -85,6 +86,9 @@ struct UiBinding {
     process_stop: Arc<AtomicBool>,
     session: Option<SessionHandle>,
     view: PlayerView,
+    /// Сервис обложек (design D5/D6 add-album-art): подписка на смены
+    /// трека и сбор ответов — из poll-таймера, инвалидация — на «Играть».
+    covers: Covers,
 }
 
 impl UiBinding {
@@ -94,8 +98,18 @@ impl UiBinding {
             process_stop,
             session: None,
             view: PlayerView::new(),
+            covers: Covers::start(),
         }
     }
+}
+
+/// Сборка изображения Slint из декодированной обложки (design D7):
+/// RGB-буфер из lib → `SharedPixelBuffer` → `Image`. Живёт в bin —
+/// lib от Slint не зависит.
+fn slint_cover(image: &CoverImage) -> slint::Image {
+    let mut buffer = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::new(image.width, image.height);
+    buffer.make_mut_bytes().copy_from_slice(&image.pixels);
+    slint::Image::from_rgb8(buffer)
 }
 
 /// Разделяемая связка для таймера и обработчиков.
@@ -121,22 +135,28 @@ fn run() -> i32 {
     // в headless его ставит сигнал (плюс сторож выхода), в UI — сигнал
     // дублирует им прямой stop активной сессии.
     let process_stop = Arc::new(AtomicBool::new(false));
-    let binding: SharedUiBinding = Arc::new(Mutex::new(UiBinding::new(
-        launch.url.clone(),
-        process_stop.clone(),
-    )));
+
+    // Связка окна — только в UI-режиме: её конструктор поднимает сервис
+    // обложек, headless создаёт свой в run_headless (находка ревью:
+    // второй воркер обложек в headless был бы осиротевшим).
+    let ui_mode = !launch.headless;
+    let binding: Option<SharedUiBinding> = ui_mode.then(|| {
+        Arc::new(Mutex::new(UiBinding::new(
+            launch.url.clone(),
+            process_stop.clone(),
+        )))
+    });
 
     // Обработчик сигнала — один на процесс (ограничение крейта), ставится
     // до ветвления режимов (design D5). Действие выбирается по режиму:
     // headless — только флаг (дальше сторож), UI — стоп активной сессии
     // и выход из цикла событий.
-    let ui_mode = !launch.headless;
     if ctrlc::set_handler({
         let process_stop = process_stop.clone();
         let binding = binding.clone();
         move || {
             process_stop.store(true, Ordering::SeqCst);
-            if ui_mode {
+            if let Some(binding) = binding.as_ref() {
                 // Паника в обработчике сигнала недопустима: отравленный
                 // замок не должен мешать главному действию — выходу из
                 // цикла событий.
@@ -160,7 +180,10 @@ fn run() -> i32 {
     if launch.headless {
         run_headless(&launch.url, &process_stop)
     } else {
-        run_ui(&binding, &process_stop)
+        run_ui(
+            &binding.expect("связка окна создана только в UI-режиме"),
+            &process_stop,
+        )
     }
 }
 
@@ -197,9 +220,23 @@ fn run_headless(url: &str, process_stop: &Arc<AtomicBool>) -> i32 {
     // метаданные приходят с первыми байтами.
     let mut ether_printer = NowPlayingPrinter::new();
     let mut last_status = Some(PlaybackStatus::Connecting);
+    // Обложки в headless (спека album-art): тот же сервис, исходы поиска
+    // пишет в лог сам воркер — здесь только подписка на смену трека
+    // (дедупликация по значению, как у эфирной печати).
+    let covers = Covers::start();
+    let mut cover_target: Option<TrackInfo> = None;
     while session.is_running() {
         let tick = session.tick();
         ether_printer.poll(&tick.station, &tick.track);
+        if tick.track != cover_target {
+            cover_target = tick.track.clone();
+            covers.track_changed(match &tick.track {
+                Some(TrackInfo::Track { artist, title }) => Some((artist, title)),
+                _ => None,
+            });
+        }
+        // Ответы только вычитываем: находки и промахи уже в логе воркера.
+        while covers.poll_reply().is_some() {}
         // Живой цикл: пауза — точный флаг underrun декодера, а не «буфер
         // пуст» (звук идёт и на низком уровне заполнения).
         let status = playback_status(tick.net, tick.playback_started, tick.underrun);
@@ -233,6 +270,10 @@ fn run_ui(binding: &SharedUiBinding, process_stop: &Arc<AtomicBool>) -> i32 {
     window.set_status(UiState::Stopped.label().into());
     window.set_can_play(true);
     window.set_can_stop(false);
+    // Заглушка обложки — дефолт свойства окна, прочитан до первого set
+    // (design D7): переиспользуется как значение сброса для не-музыки,
+    // промаха поиска и новой сессии.
+    let placeholder_cover = window.get_cover();
 
     // «Играть»: новая сессия только из «Остановлено» — гейт can-play
     // отпускает кнопку по факту завершения воркера (design: teardown
@@ -242,6 +283,7 @@ fn run_ui(binding: &SharedUiBinding, process_stop: &Arc<AtomicBool>) -> i32 {
     {
         let binding = binding.clone();
         let weak = window.as_weak();
+        let placeholder_cover = placeholder_cover.clone();
         window.on_play(move || {
             let Some(window) = weak.upgrade() else { return };
             let Ok(mut ui) = binding.lock() else { return };
@@ -267,6 +309,10 @@ fn run_ui(binding: &SharedUiBinding, process_stop: &Arc<AtomicBool>) -> i32 {
                     window.set_artist("".into());
                     window.set_track_title("".into());
                     window.set_error("".into());
+                    // Обложка тоже: гасим незавершённый поиск прошлой
+                    // сессии и показываем заглушку до первого трека.
+                    ui.covers.invalidate();
+                    window.set_cover(placeholder_cover.clone());
                 }
                 Err(e) => {
                     window.set_error(format!("не удалось запустить поток чтения: {e}").into());
@@ -317,6 +363,18 @@ fn run_ui(binding: &SharedUiBinding, process_stop: &Arc<AtomicBool>) -> i32 {
                 window.set_station(station.unwrap_or_default().into());
             }
             if let Some(slot) = update.track {
+                // Обложка следует правилу видимости трек-строки (спека
+                // player-ui/album-art): трек — асинхронный поиск, сырое
+                // название, вставка и остановка — заглушка без сети.
+                match &slot {
+                    TrackSlot::Track { artist, title } => {
+                        ui.covers.track_changed(Some((artist, title)));
+                    }
+                    _ => {
+                        ui.covers.track_changed(None);
+                        window.set_cover(placeholder_cover.clone());
+                    }
+                }
                 // Трек-строка (правило чек-листа 4.3): трек — исполнитель
                 // и название; сырой StreamTitle — только название;
                 // заглушка — название станции (без станции строка пуста
@@ -330,6 +388,15 @@ fn run_ui(binding: &SharedUiBinding, process_stop: &Arc<AtomicBool>) -> i32 {
                 };
                 window.set_artist(artist.into());
                 window.set_track_title(title.into());
+            }
+            // Ответы воркера обложек: устаревшие гасятся генерацией
+            // внутри сервиса, поэтому каждый доставленный применим;
+            // промах — заглушка (спека album-art).
+            while let Some(reply) = ui.covers.poll_reply() {
+                window.set_cover(match reply {
+                    CoverReply::Found(image) => slint_cover(&image),
+                    CoverReply::Miss => placeholder_cover.clone(),
+                });
             }
             if let Some(status) = update.status {
                 window.set_status(status.label().into());

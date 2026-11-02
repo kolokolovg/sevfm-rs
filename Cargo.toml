@@ -37,6 +37,19 @@ serde_json = { version = "1", default-features = false, features = ["std"] }
 # проектом для личного плеера. Разметка — ui/player-window.slint,
 # компиляция — build.rs; lib от Slint не зависит, только bin.
 slint = "1.18"
+# Кодирование поисковой строки сервисов обложек (кириллица в query,
+# design D1 add-album-art): минимальный RFC-3986-энкодер, крейт url
+# с парсером не нужен.
+percent-encoding = "2"
+# Ключ кеша обложек (design D4 add-album-art): sha256("artist|title") —
+# имя файла без коллизий и лимитов файловой системы. RustCrypto-хеш,
+# рантайм-зависимость только из pure-Rust-ядра digest.
+sha2 = "0.10"
+# Декод JPEG-обложек в RGB8 для свойства-изображения окна (design D7
+# add-album-art). Только jpeg: цепочка сервисов отдаёт JPEG. В итоговом
+# дереве png присутствует унификацией со slint (нужен его @image-url
+# для заглушки) — на это поведение декода не опираемся.
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 
 [build-dependencies]
 # Компиляция .slint-разметки окна в build-скрипте (версия в sync с slint).

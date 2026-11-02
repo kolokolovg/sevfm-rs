@@ -1,7 +1,9 @@
-// Окно плеера (design D4 add-player-ui). Свойства и callbacks связывает
-// main.rs: poll-таймер пишет состояние, play()/stop() запускают и
-// останавливают сессию. Заглушка обложки — статичный квадрат: цепочка
-// подгрузки обложек (iTunes/Deezer/Яндекс + кеш) — отдельный future change.
+// Окно плеера (design D4 add-player-ui, D7 add-album-art). Свойства и
+// callbacks связывает main.rs: poll-таймер пишет состояние, play()/stop()
+// запускают и останавливают сессию. Обложка — свойство-изображение с
+// встроенной заглушкой по умолчанию: main.rs кладёт найденную обложку
+// и возвращает заглушку для не-музыки и остановки (правило видимости
+// трек-строки).
 
 import { Button } from "std-widgets.slint";
 
@@ -14,6 +16,9 @@ export component PlayerWindow inherits Window {
     // (заголовок), переопределить его нельзя.
     in-out property <string> track-title;
     in-out property <string> error;
+    // Обложка текущего трека; дефолт — заглушка, Rust-сторона читает
+    // его один раз (get_cover до первого set) как значение сброса.
+    in-out property <image> cover: @image-url("cover-placeholder.png");
     // Гейты кнопок из UiState: «Играть» — только из «Остановлено».
     in-out property <bool> can-play: true;
     in-out property <bool> can-stop: false;
@@ -30,19 +35,12 @@ export component PlayerWindow inherits Window {
         padding: 24px;
         spacing: 14px;
 
-        // Заглушка обложки.
-        Rectangle {
+        // Обложка трека: найденная картинка или заглушка, contain —
+        // квадрат без искажений при любых пропорциях картинки.
+        Image {
             height: 210px;
-            border-radius: 14px;
-            background: #1e2230;
-            border-width: 1px;
-            border-color: #2a2f42;
-
-            Text {
-                text: "♪";
-                color: #4a5170;
-                font-size: 64px;
-            }
+            source: root.cover;
+            image-fit: ImageFit.contain;
         }
 
         // Станция.
