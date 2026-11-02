@@ -42,7 +42,8 @@ jobs:
       - name: cargo-deb
         # Мажор запинен: поведение флагов/ассетов должно оставаться тем,
         # что валидировано на этой конфигурации (локально — 3.8.0).
-        run: cargo install cargo-deb --locked --version 3
+        # Квалификатор обязателен: bare "3" cargo не парсит.
+        run: cargo install cargo-deb --locked --version ^3
       - name: Версия из Cargo.toml
         id: version
         run: echo "version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "sevfm") | .version')" >> "$GITHUB_OUTPUT"
