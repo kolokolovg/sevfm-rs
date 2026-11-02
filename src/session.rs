@@ -22,12 +22,12 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::buffer::RingBuffer;
-use crate::icy::{SharedNowPlaying, TrackInfo};
+use crate::icy::{SharedEtherGate, SharedNowPlaying, TrackInfo};
 use crate::net::{GarbageBudget, Link, NetStatus, SharedLink, SharedNetStatus, spawn_reader};
 use crate::pipeline::{Mp3Source, Outcome, SharedOutcome};
 use crate::say;
@@ -59,7 +59,8 @@ pub struct SessionTick {
     pub net: NetStatus,
     /// Звук уже запускался (предбуфер пройден, устройство открыто).
     pub playback_started: bool,
-    /// Декодер в underrun-паузе (точный признак паузы звука).
+    /// Декодер в underrun-паузе (пауза декодера: звук доигрывает
+    /// сэмпл-FIFO ещё до ~2,4 с — design D8).
     pub underrun: bool,
     /// Название станции из `icy-name`, начиная с первого соединения.
     pub station: Option<String>,
@@ -80,6 +81,13 @@ pub struct SessionHandle {
     worker: Option<JoinHandle<()>>,
     now_playing: SharedNowPlaying,
     net_status: SharedNetStatus,
+    /// Ворота эфира: дренаж в `tick` публикует трек, когда его аудио
+    /// зазвучало (design add-ether-sync D4).
+    ether_gate: SharedEtherGate,
+    /// Позиция звучания в аудиобайтах: ставит потребитель сэмплов при
+    /// исчерпании чанка FIFO (design D8) — не позиция декодера, который
+    /// бежит впереди звука на заполненный FIFO.
+    sound_pos: Arc<AtomicU64>,
     /// Буфер тракта: underrun-флаг для сводного статуса.
     buffer: RingBuffer,
     /// «Звук запускался» — ставит воркер после открытия устройства.
@@ -111,7 +119,10 @@ impl SessionHandle {
     }
 
     /// Снимок состояния для poll-потребителей (статусы, эфир, исход).
+    /// Перед снапшотом дренирует ворота эфира (design add-ether-sync D4):
+    /// смена трека, чьё аудио зазвучало, видна потребителю в этом же тике.
     pub fn tick(&self) -> SessionTick {
+        drain_ether(&self.ether_gate, &self.sound_pos, &self.now_playing);
         // Копии под короткими замками: потребитель не держит reader
         // в Meta-callback и не мешает воркеру.
         let (station, track) = {
@@ -150,6 +161,26 @@ impl SessionHandle {
     }
 }
 
+/// Дренаж ворот эфира (design D4): публикует в `now_playing` смены,
+/// чьё аудио зазвучало — `sound_pos` ставит потребитель сэмплов (design
+/// D8), не декодер. Отдельная функция — проводка «позиция звучания →
+/// дренаж → слот эфира» проверяется юнит-тестом без аудиоустройства.
+/// Порядок захвата: замок ворот, затем замок эфира; reader берёт их
+/// порознь (push / станция), цикла не возникает.
+fn drain_ether(
+    ether_gate: &crate::icy::EtherGate,
+    sound_pos: &std::sync::atomic::AtomicU64,
+    now_playing: &SharedNowPlaying,
+) {
+    let played = sound_pos.load(Ordering::Relaxed);
+    if let Some(track) = ether_gate.drain_until(played) {
+        now_playing
+            .lock()
+            .expect("замок эфира не отравлен: присваивание не паникует")
+            .track = Some(track);
+    }
+}
+
 /// Сессия воспроизведения: пространство имён для [`PlayerSession::start`].
 pub struct PlayerSession;
 
@@ -165,6 +196,8 @@ impl PlayerSession {
         let link = Link::shared();
         let net_status: SharedNetStatus = Arc::new(Mutex::new(NetStatus::Connecting));
         let now_playing: SharedNowPlaying = Default::default();
+        let ether_gate: SharedEtherGate = Default::default();
+        let sound_pos = Arc::new(AtomicU64::new(0));
         let session_stop = Arc::new(AtomicBool::new(false));
         let playback_started = Arc::new(AtomicBool::new(false));
         let outcome = Arc::new(Mutex::new(None));
@@ -180,6 +213,7 @@ impl PlayerSession {
             link.clone(),
             net_status.clone(),
             now_playing.clone(),
+            ether_gate.clone(),
         )?;
 
         let worker = match std::thread::Builder::new()
@@ -191,6 +225,7 @@ impl PlayerSession {
                 let session_stop = session_stop.clone();
                 let playback_started = playback_started.clone();
                 let outcome = outcome.clone();
+                let sound_pos = sound_pos.clone();
                 move || {
                     // Паника воркера обязана стать Fatal-исходом: UI читает
                     // только слот (join там недоступен), тихое «Остановлено»
@@ -206,6 +241,7 @@ impl PlayerSession {
                             &process_stop,
                             &session_stop,
                             &playback_started,
+                            &sound_pos,
                         )
                     }))
                     .unwrap_or_else(|_| {
@@ -237,6 +273,8 @@ impl PlayerSession {
             worker: Some(worker),
             now_playing,
             net_status,
+            ether_gate,
+            sound_pos,
             buffer,
             playback_started,
             outcome,
@@ -257,6 +295,7 @@ fn live_loop(
     process_stop: &Arc<AtomicBool>,
     session_stop: &Arc<AtomicBool>,
     playback_started: &Arc<AtomicBool>,
+    sound_pos: &Arc<AtomicU64>,
 ) -> SessionOutcome {
     let stopping = || process_stop.load(Ordering::SeqCst) || session_stop.load(Ordering::SeqCst);
 
@@ -288,6 +327,7 @@ fn live_loop(
         session_stop.clone(),
         link.clone(),
         pipeline_outcome.clone(),
+        sound_pos.clone(),
     ) {
         Ok(source) => source,
         Err(e) => {
@@ -395,7 +435,14 @@ fn open_output_device(crashed: &Arc<AtomicBool>) -> Result<rodio::MixerDeviceSin
         builder
             .with_error_callback({
                 let crashed = crashed.clone();
-                move |_error| crashed.store(true, Ordering::SeqCst)
+                move |error| {
+                    // Текст ошибки обязателен (design add-ether-sync D8):
+                    // без него Fatal ложно винит «аудиоустройство»,
+                    // а причина была в блокировке колбэка или смерти
+                    // устройства — теперь различимо в stderr.
+                    say(&format!("аудиопоток: ошибка вывода: {error}"));
+                    crashed.store(true, Ordering::SeqCst);
+                }
             })
             .open_stream()
     });
@@ -421,6 +468,60 @@ fn open_output_device(crashed: &Arc<AtomicBool>) -> Result<rodio::MixerDeviceSin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::icy::{EtherGate, TrackInfo};
+
+    /// Проводка дренажа (design D4, ревью hunter#3): смена публикуется
+    /// строго по позиции звучания — не раньше и не теряясь. Запись со
+    /// смещением 0 легитимно публикуется нулевой позицией («ничего ещё
+    /// не звучало» — это и есть момент до первого байта), шум одного
+    /// чанка ~26 мс.
+    #[test]
+    fn drain_ether_publishes_by_sounding_position() {
+        let gate = EtherGate::default();
+        let now_playing: SharedNowPlaying = Default::default();
+        let sound_pos = std::sync::atomic::AtomicU64::new(0);
+
+        let first = TrackInfo::Raw {
+            title: "первый".to_owned(),
+        };
+        let second = TrackInfo::Raw {
+            title: "второй".to_owned(),
+        };
+        gate.push(100, first.clone());
+        gate.push(200, second.clone());
+
+        drain_ether(&gate, &sound_pos, &now_playing);
+        assert!(
+            now_playing
+                .lock()
+                .expect("замок эфира не отравлен: присваивание не паникует")
+                .track
+                .is_none(),
+            "до звучания публикаций нет"
+        );
+
+        sound_pos.store(150, Ordering::Relaxed);
+        drain_ether(&gate, &sound_pos, &now_playing);
+        assert_eq!(
+            now_playing
+                .lock()
+                .expect("замок эфира не отравлен: присваивание не паникует")
+                .track,
+            Some(first),
+            "первая смена опубликована по позиции звучания"
+        );
+
+        sound_pos.store(300, Ordering::Relaxed);
+        drain_ether(&gate, &sound_pos, &now_playing);
+        assert_eq!(
+            now_playing
+                .lock()
+                .expect("замок эфира не отравлен: присваивание не паникует")
+                .track,
+            Some(second),
+            "вторая смена опубликована по позиции звучания"
+        );
+    }
 
     /// Link с поднятым флагом fatal (модель отказа сервера).
     fn fatal_link() -> SharedLink {

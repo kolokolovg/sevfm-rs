@@ -18,6 +18,7 @@
 //! (JSON с исполнителем/названием, рекламные вставки, сырая строка).
 
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 /// Вес одного шага размерного байта: блок растёт по 16 байтов (спека
@@ -178,6 +179,77 @@ pub struct NowPlaying {
 /// Разделяемый слот эфира (паттерн `SharedNetStatus`).
 pub type SharedNowPlaying = Arc<Mutex<NowPlaying>>;
 
+/// Ворота эфира (design add-ether-sync D2): очередь принятых метаблоков
+/// с привязкой к смещению в аудиобайтах. Метаблок относится ко всему
+/// аудио, записанному в буфер ПОСЛЕ него, поэтому трек публикуется не
+/// приёмом, а звуком — когда позиция чтения из буфера доходит до
+/// смещения. Пишет reader-поток (`push`), дренирует потребитель в тике
+/// сессии (`drain_until` + запись в [`NowPlaying`]); `reset` — при
+/// очистке буфера, когда ожидающее аудио выброшено.
+#[derive(Default)]
+pub struct EtherGate {
+    /// Очередь (смещение аудиобайтов, трек) в порядке приёма; смещения
+    /// неубывающие — кадрировщик отдаёт фреймы по порядку потока.
+    queue: Mutex<VecDeque<(u64, TrackInfo)>>,
+}
+
+/// Разделяемые ворота эфира (паттерн `SharedNowPlaying`).
+pub type SharedEtherGate = Arc<EtherGate>;
+
+/// Потолок очереди ворот (ревью add-ether-sync, security-auditor):
+/// легитимный максимум — переполнение буферов тракта (кольцо 512 КиБ +
+/// внутренний буфер MSS + сэмпл-FIFO) при минимальном `metaint` 512 Б
+/// ≈ ~1100 записей. Больше — злонамеренный meta-flood: в фазе поиска
+/// первого кадра (до 30 с на попытку) сеть кормит метаблоки быстрее,
+/// чем звук потребляет, и без потолка очередь растёт со скоростью сети.
+/// Переполнение вытесняет старейшие: их аудио всё равно ещё не звучало,
+/// наблюдатель теряет только смены, которые по отдельности не видны.
+const MAX_PENDING: usize = 2048;
+
+impl EtherGate {
+    /// Метаблок принят: трек `track` относится к аудио, которое будет
+    /// записано после смещения `offset` (всё аудио, записанное в буфер
+    /// к моменту приёма). Переполнение потолка вытесняет старейшие
+    /// записи (см. [`MAX_PENDING`]).
+    pub fn push(&self, offset: u64, track: TrackInfo) {
+        let mut queue = self
+            .queue
+            .lock()
+            .expect("замок ворот эфира не отравлен: присваивание не паникует");
+        queue.push_back((offset, track));
+        while queue.len() > MAX_PENDING {
+            queue.pop_front();
+        }
+    }
+
+    /// Публикует всё прозвучавшее: выталкивает записи с
+    /// `offset <= played` (`played` — позиция чтения из буфера) и
+    /// возвращает последнюю; промежуточные смены одной пачкой наблюдатель
+    /// не видит по отдельности. Ничего не прозвучало — `None`, очередь
+    /// не тронута.
+    pub fn drain_until(&self, played: u64) -> Option<TrackInfo> {
+        let mut queue = self
+            .queue
+            .lock()
+            .expect("замок ворот эфира не отравлен: присваивание не паникует");
+        let mut latest = None;
+        while queue.front().is_some_and(|(offset, _)| *offset <= played) {
+            latest = queue.pop_front().map(|(_, track)| track);
+        }
+        latest
+    }
+
+    /// Сброс ожидающих смен: аудио, к которому они привязаны, выброшено
+    /// очисткой буфера — их смещения больше не настанут. Последний
+    /// опубликованный трек (в [`NowPlaying`]) сброс не трогает.
+    pub fn reset(&self) {
+        self.queue
+            .lock()
+            .expect("замок ворот эфира не отравлен: присваивание не паникует")
+            .clear();
+    }
+}
+
 /// Разбирает содержимое метаблока (без размерного байта) по правилам
 /// спеки icy-metadata: JSON с `artist`/`name` — трек; пустой `artist`
 /// или `type` ≠ «М» — вставка (только название); невалидный JSON или
@@ -278,6 +350,83 @@ fn unescape_doubled_quotes(value: &[u8]) -> Cow<'_, [u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ворота эфира (design add-ether-sync D2): публикация по смещению
+    /// звучания — недобор ждёт и очередь не тронута, прозвучавшее
+    /// публикуется последней сменой пачки, повторный дренаж без чтения
+    /// молчит.
+    #[test]
+    fn ether_gate_publishes_by_played_offset() {
+        let gate = EtherGate::default();
+        assert_eq!(gate.drain_until(0), None, "пустая очередь");
+
+        let first = TrackInfo::Raw {
+            title: "первый".to_owned(),
+        };
+        let second = TrackInfo::Raw {
+            title: "второй".to_owned(),
+        };
+        gate.push(100, first.clone());
+        gate.push(200, second);
+
+        // Недобор: смещение ещё не наступило — очередь не тронута.
+        assert_eq!(gate.drain_until(99), None);
+        // Первое смещение наступило — публикуется.
+        assert_eq!(gate.drain_until(100), Some(first));
+
+        // Пачка: вторая и третья одним дренажём — побеждает последняя.
+        let third = TrackInfo::Raw {
+            title: "третий".to_owned(),
+        };
+        gate.push(300, third.clone());
+        assert_eq!(gate.drain_until(400), Some(third));
+        assert_eq!(gate.drain_until(u64::MAX), None, "очередь пуста");
+    }
+
+    /// Сброс ворот: ожидающие смены выбрасываются, публикация после
+    /// сброса начинается с чистой очереди.
+    #[test]
+    fn ether_gate_reset_drops_pending_changes() {
+        let gate = EtherGate::default();
+        gate.push(
+            100,
+            TrackInfo::Raw {
+                title: "старый".to_owned(),
+            },
+        );
+        gate.reset();
+        assert_eq!(gate.drain_until(u64::MAX), None, "ожидающая смена сброшена");
+
+        let fresh = TrackInfo::Raw {
+            title: "новый".to_owned(),
+        };
+        gate.push(500, fresh.clone());
+        assert_eq!(gate.drain_until(500), Some(fresh));
+    }
+
+    /// Потолок очереди (security-аудит ревью): meta-flood не растит
+    /// память бесконечно — старейшие записи вытесняются, дренаж видит
+    /// только хвост очереди.
+    #[test]
+    fn ether_gate_cap_evicts_oldest_under_flood() {
+        let gate = EtherGate::default();
+        for index in 0..(super::MAX_PENDING + 3) as u64 {
+            gate.push(
+                index,
+                TrackInfo::Raw {
+                    title: format!("трек {index}"),
+                },
+            );
+        }
+        // Вытеснены первые три записи — дренаж отдаёт последнюю из хвоста.
+        assert_eq!(
+            gate.drain_until(u64::MAX)
+                .map(|track| track.title().to_owned()),
+            Some(format!("трек {}", super::MAX_PENDING + 2)),
+            "переполнение вытесняет старейшие, не память"
+        );
+        assert_eq!(gate.drain_until(u64::MAX), None, "хвост отдан целиком");
+    }
 
     /// Сборка кадрированных выходов для таблиц фреймера.
     fn collect(framer: &mut IcyFramer, chunks: &[&[u8]]) -> (Vec<u8>, Vec<Vec<u8>>) {

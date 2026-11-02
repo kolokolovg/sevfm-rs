@@ -23,7 +23,7 @@
 //! получает конец потока, писатель — ошибку записи.
 
 use std::cmp::min;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -96,9 +96,16 @@ struct Shared {
     data_ready: Condvar,
     /// Будит писателей: появилось место или буфер закрыт.
     space_ready: Condvar,
-    /// Декодер в underrun-паузе (ждёт повторного достижения предбуфера):
-    /// точный признак паузы звука для статуса воспроизведения.
+    /// Декодер в underrun-паузе (ждёт повторного достижения предбуфера).
+    /// После выноса декодирования в поток (design D8) это признак паузы
+    /// ДЕКОДЕРА: звук из сэмпл-FIFO доигрывает ещё до ~2,4 с — статус
+    /// «Буферизация» появляется чуть раньше фактической тишины.
     underrun: AtomicBool,
+    /// Сколько байтов всего отдано читателю за жизнь буфера (design
+    /// add-ether-sync D3): монотонная позиция звучащего звука в шкале
+    /// «аудиобайты, записанные в буфер». `clear()` выбрасывает только
+    /// непрочитанное — счётчик не откатывается.
+    total_read: AtomicU64,
 }
 
 /// Хэндл кольцевого буфера. `Clone` — разделяемое владение одним буфером:
@@ -130,6 +137,7 @@ impl RingBuffer {
                 data_ready: Condvar::new(),
                 space_ready: Condvar::new(),
                 underrun: AtomicBool::new(false),
+                total_read: AtomicU64::new(0),
             }),
         }
     }
@@ -156,11 +164,21 @@ impl RingBuffer {
     }
 
     /// Декодер стоит в underrun-паузе (буфер опустошался, ждёт повторного
-    /// предбуфера) — звук приостановлен. Отмечает `BufferReader`;
-    /// статус воспроизведения различает паузу от «буфер почти пуст,
-    /// но звук идёт».
+    /// предбуфера). Отмечает `BufferReader` декод-потока; звук при этом
+    /// доигрывает сэмпл-FIFO (≤2,4 с) — мгновенной паузой звука это стало
+    /// после D8 не сразу (см. поле `underrun`).
     pub fn is_underrun(&self) -> bool {
         self.shared.underrun.load(Ordering::SeqCst)
+    }
+
+    /// Позиция звучащего звука: сколько байтов всего отдано читателю за
+    /// жизнь буфера. Шкала та же, что у аудиобайтов, записанных writer'ом:
+    /// ворота эфира сверяют смещения метаблоков с этим числом, `clear()`
+    /// позицию не откатывает (design add-ether-sync D3). `Relaxed`
+    /// достаточен: дренаж читает атомик до захвата замка очереди, гонка
+    /// стоит один такт опроса, монотонность гарантирует RMW.
+    pub fn total_read(&self) -> u64 {
+        self.shared.total_read.load(Ordering::Relaxed)
     }
 
     /// Отметить вход/выход декодера из underrun-паузы (вызывает
@@ -212,6 +230,11 @@ impl RingBuffer {
         loop {
             if state.len > 0 {
                 let n = state.copy_out(out);
+                // Позиция звука растёт только реально отданными байтами
+                // (design add-ether-sync D3) — под замком, атомарный RMW.
+                self.shared
+                    .total_read
+                    .fetch_add(n as u64, Ordering::Relaxed);
                 self.shared.space_ready.notify_all();
                 return Ok(n);
             }
@@ -532,6 +555,40 @@ mod tests {
         let mut out = [0u8; 4];
         assert_eq!(buffer_full.read(&mut out, SETTLE * 4).unwrap(), 4);
         assert_eq!(out, [9, 10, 11, 12], "после clear — только новые байты");
+    }
+
+    /// Позиция звука (design add-ether-sync D3): растёт ровно на
+    /// прочитанное, не двигается записью и таймаутом пустого чтения,
+    /// `clear()` не откатывает — новые данные читаются дальше по той же
+    /// шкале.
+    #[test]
+    fn total_read_tracks_read_bytes_and_survives_clear() {
+        let buffer = RingBuffer::new(16, 8);
+        buffer.write(&[1, 2, 3, 4]).unwrap();
+        assert_eq!(buffer.total_read(), 0, "запись не двигает позицию звука");
+
+        let mut out = [0u8; 3];
+        assert_eq!(buffer.read(&mut out, SETTLE).unwrap(), 3);
+        assert_eq!(buffer.total_read(), 3);
+        assert_eq!(buffer.read(&mut out[..1], SETTLE).unwrap(), 1);
+        assert_eq!(buffer.total_read(), 4);
+
+        // Пустое чтение — позицию не двигает.
+        assert_eq!(
+            buffer.read(&mut out, Duration::from_millis(20)),
+            Err(ReadError::Timeout)
+        );
+        assert_eq!(buffer.total_read(), 4, "таймаут не двигает позицию");
+
+        // Clear выбрасывает непрочитанное: прочитанное не отменяется.
+        buffer.write(&[5, 6]).unwrap();
+        buffer.clear();
+        assert_eq!(buffer.total_read(), 4, "clear не откатывает позицию");
+
+        // Новые данные — дальше по той же монотонной шкале.
+        buffer.write(&[7, 8]).unwrap();
+        assert_eq!(buffer.read(&mut out[..2], SETTLE).unwrap(), 2);
+        assert_eq!(buffer.total_read(), 6);
     }
 
     /// Конкуренция: писатель гонит 1 МиБ случайными порциями сквозь буфер

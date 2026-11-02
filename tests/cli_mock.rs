@@ -192,10 +192,12 @@ fn permanent_status_exits_with_code_2() {
     server.stop();
 }
 
-/// Метаданные ICY доходят до пользователя (задача 3.1): станция и трек
-/// печатаются в stderr при подключении и первой смене. Строки видны ещё
-/// в стартовом цикле (до открытия аудиоустройства), поэтому тест честен и
-/// на машине без звука; SIGINT останавливает процесс с кодом 0.
+/// Метаданные ICY доходят до пользователя, синхронно со звуком
+/// (design add-ether-sync): станция печатается сразу по соединению,
+/// трек — когда декодер прочитал аудио до смещения метаблока (после
+/// старта воспроизведения), поэтому строка трека всегда позже строки
+/// станции. Тест требует рабочего аудиопути (как session-тесты);
+/// SIGINT останавливает процесс с кодом 0.
 #[cfg(unix)] // сигнал доставляется утилитой kill(1)
 #[test]
 fn icy_metadata_printed_to_stderr() {
@@ -231,22 +233,33 @@ fn icy_metadata_printed_to_stderr() {
     let stderr = child.stderr.take().expect("stderr подключён");
     let reader = std::io::BufReader::new(stderr);
 
-    let mut seen_station = false;
-    let mut seen_track = false;
+    // Позиции первых вхождений: станция — сразу, трек — по звуку.
+    let mut station_at: Option<usize> = None;
+    let mut track_at: Option<usize> = None;
     let deadline = Instant::now() + Duration::from_secs(30);
-    for line in reader.lines() {
+    for (index, line) in reader.lines().enumerate() {
         let Ok(line) = line else { break };
-        seen_station |= line.contains("станция: Говорит Севастополь");
-        seen_track |= line.contains("сейчас в эфире: ВЛАДИМИР ТРОШИН — ЮНОСТЬ МОЯ");
-        if (seen_station && seen_track) || Instant::now() > deadline {
+        if station_at.is_none() && line.contains("станция: Говорит Севастополь")
+        {
+            station_at = Some(index);
+        }
+        if track_at.is_none() && line.contains("сейчас в эфире: ВЛАДИМИР ТРОШИН — ЮНОСТЬ МОЯ")
+        {
+            track_at = Some(index);
+        }
+        if (station_at.is_some() && track_at.is_some()) || Instant::now() > deadline {
             break;
         }
     }
-    assert!(
-        seen_station,
-        "строка станции не появилась за 30 с (track: {seen_track})"
+    let (station_at, track_at) = (
+        station_at.expect("строка станции не появилась за 30 с"),
+        track_at.expect("строка трека не появилась за 30 с"),
     );
-    assert!(seen_track, "строка трека не появилась за 30 с");
+    assert!(
+        station_at < track_at,
+        "станция печатается до трека: сразу по соединению, трек — по звуку \
+         (станция: {station_at}, трек: {track_at})"
+    );
 
     let signalled = Command::new("kill")
         .args(["-INT", &child.id().to_string()])

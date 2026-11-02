@@ -56,6 +56,7 @@ fn reconnect_after_drop_continues_stream() {
         link,
         net_status,
         now_playing,
+        sevfm::icy::SharedEtherGate::default(),
     )
     .expect("поток reader'а запускается в тесте");
 
@@ -124,6 +125,7 @@ fn garbage_budget_exceeded_reconnects_without_hang() {
         link,
         net_status,
         now_playing,
+        sevfm::icy::SharedEtherGate::default(),
     )
     .expect("поток reader'а запускается в тесте");
 
@@ -207,6 +209,7 @@ fn stop_flag_terminates_reader_within_second_on_silent_server() {
         link,
         net_status,
         now_playing,
+        sevfm::icy::SharedEtherGate::default(),
     )
     .expect("поток reader'а запускается в тесте");
 
@@ -265,6 +268,7 @@ fn unreachable_server_means_retries_not_failure() {
         link,
         net_status,
         now_playing,
+        sevfm::icy::SharedEtherGate::default(),
     )
     .expect("поток reader'а запускается в тесте");
 
@@ -309,6 +313,7 @@ fn permanent_status_terminates_reader_with_fatal_flag() {
             link.clone(),
             net_status,
             now_playing,
+            sevfm::icy::SharedEtherGate::default(),
         )
         .expect("поток reader'а запускается в тесте");
 
@@ -360,6 +365,7 @@ fn reconnect_request_closes_connection_and_clears_buffer() {
         link.clone(),
         net_status,
         now_playing,
+        sevfm::icy::SharedEtherGate::default(),
     )
     .expect("поток reader'а запускается в тесте");
 
@@ -440,6 +446,7 @@ fn dripping_server_below_min_rate_reconnects() {
         link,
         net_status,
         now_playing,
+        sevfm::icy::SharedEtherGate::default(),
     )
     .expect("поток reader'а запускается в тесте");
 
@@ -505,6 +512,7 @@ fn net_status_tracks_connect_stream_reconnect() {
         link,
         net_status.clone(),
         now_playing,
+        sevfm::icy::SharedEtherGate::default(),
     )
     .expect("поток reader'а запускается в тесте");
 
@@ -585,10 +593,10 @@ fn wait_for_connections(server: &MockServer, want: usize) {
     }
 }
 
-/// Метаблоки вырезаются из аудиопути (задача 2.2, спека icy-metadata):
-/// байты, дошедшие до буфера, равны чистой фикстуре байт-в-байт, станция
-/// и трек появляются в слоте эфира; договорённость запрошена на каждом
-/// соединении.
+/// Метаблоки вырезаются из аудиопути (спека icy-metadata): байты,
+/// дошедшие до буфера, равны чистой фикстуре байт-в-байт, станция
+/// появляется сразу, трек — когда его аудио «проиграно» (ворота эфира,
+/// design add-ether-sync); договорённость запрошена на каждом соединении.
 #[test]
 fn icy_blocks_are_stripped_and_track_updates() {
     use sevfm::icy::TrackInfo;
@@ -612,6 +620,7 @@ fn icy_blocks_are_stripped_and_track_updates() {
     let link = Link::shared();
     let net_status = net::SharedNetStatus::default();
     let now_playing = sevfm::icy::SharedNowPlaying::default();
+    let ether_gate = sevfm::icy::SharedEtherGate::default();
     let reader = net::spawn_reader(
         server.url(),
         buffer.clone(),
@@ -620,27 +629,31 @@ fn icy_blocks_are_stripped_and_track_updates() {
         link,
         net_status,
         now_playing.clone(),
+        ether_gate.clone(),
     )
     .expect("поток reader'а запускается в тесте");
 
     let deadline = Instant::now() + Duration::from_secs(15);
-    let mut got = vec![0u8; 64 * 1024];
-    let mut filled = 0usize;
-    while filled < got.len() {
-        let remaining = deadline.saturating_duration_since(Instant::now());
+    let mut got = Vec::new();
+    while got.len() < 64 * 1024 {
         assert!(
-            !remaining.is_zero(),
-            "аудио не дошло за 15 с: {filled} байтов"
+            Instant::now() < deadline,
+            "аудио не дошло за 15 с: {} байтов",
+            got.len()
         );
-        match buffer.read(&mut got[filled..], remaining) {
-            Ok(n) => filled += n,
-            Err(ReadError::Timeout) => {}
-            Err(ReadError::Closed) => panic!("буфер закрыт раньше конца потока"),
-        }
+        got.extend(common::play_chunk(
+            &buffer,
+            &ether_gate,
+            &now_playing,
+            16 * 1024,
+        ));
     }
     // Аудиопуть чист: метаблоки вырезаны до буфера, байт-в-байт фикстура.
     assert_eq!(got, fixture[..64 * 1024], "метаблоки попали в аудиопуть");
     wait_for_connections(&server, 2);
+    // Финальный метаблок (смещение 64 КиБ) приходит уже после последнего
+    // аудиобайта: тик-дренаж после переподключения публикует его.
+    common::play_chunk(&buffer, &ether_gate, &now_playing, 0);
     {
         let ether = now_playing
             .lock()
@@ -662,8 +675,9 @@ fn icy_blocks_are_stripped_and_track_updates() {
     server.stop();
 }
 
-/// Смена трека по сценарным метаблокам (задача 2.2): последний блок
-/// побеждает — после цикла трек/вставка в слоте соответствует ему.
+/// Смена трека по сценарным метаблокам: последний блок побеждает —
+/// когда его аудио «проиграно», трек/вставка в слоте соответствует ему
+/// (промежуточные смены пачкой не показываются по отдельности).
 #[test]
 fn icy_track_changes_with_blocks() {
     use sevfm::icy::TrackInfo;
@@ -690,6 +704,7 @@ fn icy_track_changes_with_blocks() {
     let link = Link::shared();
     let net_status = net::SharedNetStatus::default();
     let now_playing = sevfm::icy::SharedNowPlaying::default();
+    let ether_gate = sevfm::icy::SharedEtherGate::default();
     let reader = net::spawn_reader(
         server.url(),
         buffer.clone(),
@@ -698,11 +713,11 @@ fn icy_track_changes_with_blocks() {
         link,
         net_status,
         now_playing.clone(),
+        ether_gate.clone(),
     )
     .expect("поток reader'а запускается в тесте");
 
     let deadline = Instant::now() + Duration::from_secs(15);
-    let mut sink = vec![0u8; 8 * 1024];
     while now_playing
         .lock()
         .expect("замок эфира не отравлен: присваивание не паникует")
@@ -715,9 +730,10 @@ fn icy_track_changes_with_blocks() {
             Instant::now() < deadline,
             "смена трека не наблюдалась за 15 с"
         );
-        // Держим буфер ненаполненным: поток дорабатывает до последнего
-        // блока, не застревая в backpressure.
-        let _ = buffer.read(&mut sink, Duration::from_millis(10));
+        // «Проигрываем» следующую порцию: поток дорабатывает до последнего
+        // блока, буфер не переполняется (нет backpressure), дренаж публикует
+        // смены по мере звучания.
+        common::play_chunk(&buffer, &ether_gate, &now_playing, 8 * 1024);
     }
     assert_eq!(
         server.connections(),
@@ -731,9 +747,10 @@ fn icy_track_changes_with_blocks() {
 }
 
 /// Сервер без ICY (нет icy-заголовков в ответе): чистый MP3 без
-/// метаданных — воспроизведение как в фазе 1, слот эфира пуст (спека:
-/// отсутствие интервала — не ошибка). Запрос метаданных клиент шлёт всё
-/// равно — договорённость на каждом соединении.
+/// метаданных — воспроизведение как в фазе 1, слот эфира пуст даже
+/// после дренажа ворот (спека: отсутствие интервала — не ошибка).
+/// Запрос метаданных клиент шлёт всё равно — договорённость на каждом
+/// соединении.
 #[test]
 fn no_icy_server_plays_plain_stream() {
     let fixture = common::fixture_bytes();
@@ -748,6 +765,7 @@ fn no_icy_server_plays_plain_stream() {
     let link = Link::shared();
     let net_status = net::SharedNetStatus::default();
     let now_playing = sevfm::icy::SharedNowPlaying::default();
+    let ether_gate = sevfm::icy::SharedEtherGate::default();
     let reader = net::spawn_reader(
         server.url(),
         buffer.clone(),
@@ -756,6 +774,7 @@ fn no_icy_server_plays_plain_stream() {
         link,
         net_status,
         now_playing.clone(),
+        ether_gate.clone(),
     )
     .expect("поток reader'а запускается в тесте");
 
@@ -775,6 +794,8 @@ fn no_icy_server_plays_plain_stream() {
         }
     }
     assert_eq!(got, fixture[..64 * 1024]);
+    // Дренаж по позиции чтения: без метаблоков публиковать нечего.
+    common::play_chunk(&buffer, &ether_gate, &now_playing, 0);
     {
         let ether = now_playing
             .lock()
@@ -792,7 +813,8 @@ fn no_icy_server_plays_plain_stream() {
 
 /// Переподключение переустанавливает договорённость (спека icy-metadata):
 /// кадрирование второго соединения начинается с его заголовков заново,
-/// аудио обоих кусков сшито без потерь, трек — из последнего блока.
+/// аудио обоих кусков сшито без потерь (шкала аудиобайтов сессии непрерывна),
+/// трек второго соединения публикуется, когда его аудио «проиграно».
 #[test]
 fn reconnect_reframes_icy_stream() {
     use sevfm::icy::TrackInfo;
@@ -826,6 +848,7 @@ fn reconnect_reframes_icy_stream() {
     let link = Link::shared();
     let net_status = net::SharedNetStatus::default();
     let now_playing = sevfm::icy::SharedNowPlaying::default();
+    let ether_gate = sevfm::icy::SharedEtherGate::default();
     let reader = net::spawn_reader(
         server.url(),
         buffer.clone(),
@@ -834,23 +857,24 @@ fn reconnect_reframes_icy_stream() {
         link,
         net_status,
         now_playing.clone(),
+        ether_gate.clone(),
     )
     .expect("поток reader'а запускается в тесте");
 
     let deadline = Instant::now() + Duration::from_secs(15);
-    let mut got = vec![0u8; 64 * 1024];
-    let mut filled = 0usize;
-    while filled < got.len() {
-        let remaining = deadline.saturating_duration_since(Instant::now());
+    let mut got = Vec::new();
+    while got.len() < 64 * 1024 {
         assert!(
-            !remaining.is_zero(),
-            "поток не дошёл за 15 с: {filled} байтов"
+            Instant::now() < deadline,
+            "поток не дошёл за 15 с: {} байтов",
+            got.len()
         );
-        match buffer.read(&mut got[filled..], remaining) {
-            Ok(n) => filled += n,
-            Err(ReadError::Timeout) => {}
-            Err(ReadError::Closed) => panic!("буфер закрыт раньше конца потока"),
-        }
+        got.extend(common::play_chunk(
+            &buffer,
+            &ether_gate,
+            &now_playing,
+            16 * 1024,
+        ));
     }
     assert_eq!(got, fixture[..64 * 1024], "куски сшиты без потерь и мусора");
     wait_for_connections(&server, 2);
@@ -860,9 +884,9 @@ fn reconnect_reframes_icy_stream() {
         2,
         "договорённость на каждом соединении"
     );
-    // Трек второго соединения может дойти до слота позже последнего
-    // байта буфера: поллим до нужного TrackInfo с дедлайном (образец —
-    // icy_track_changes_with_blocks).
+    // Трек второго соединения (смещение 64 КиБ) публикуется, когда его
+    // аудио прочитано: тик-дренаж с порцией «проигрывания» (paced-выдача
+    // могла ещё отдавать последние байты).
     let expected_track = Some(TrackInfo::Track {
         artist: "ИСПОЛНИТЕЛЬ".to_owned(),
         title: "ВТОРОЙ ТРЕК".to_owned(),
@@ -877,17 +901,362 @@ fn reconnect_reframes_icy_stream() {
             Instant::now() < deadline,
             "трек второго соединения не наблюдался за 15 с"
         );
-        std::thread::sleep(Duration::from_millis(10));
+        common::play_chunk(&buffer, &ether_gate, &now_playing, 4 * 1024);
     }
     // Guard в блоке: именованная привязка живёт до конца функции и
     // удерживала бы замок эфира через stop/join — а reader'у нужен он
-    // в Meta-callback, получался дедлок (паттерн соседних тестов выше).
+    // при записи станции нового соединения (паттерн соседних тестов).
     {
         let ether = now_playing
             .lock()
             .expect("замок эфира не отравлен: присваивание не паникует");
         assert_eq!(ether.station.as_deref(), Some("Говорит Севастополь"));
     }
+
+    stop.store(true, Ordering::SeqCst);
+    reader.join().expect("reader завершается по флагу");
+    server.stop();
+}
+
+/// Синхронизация трека со звуком (спека icy-metadata, design
+/// add-ether-sync): станция публикуется сразу по соединению, трек —
+/// только когда «проиграно» аудио до смещения метаблока; тики без
+/// чтения (буферизация) заголовок не двигают и не сбрасывают.
+#[test]
+fn ether_change_waits_for_played_audio() {
+    use sevfm::icy::TrackInfo;
+
+    let fixture = common::fixture_bytes();
+    let metaint = 16 * 1024;
+    let framed = common::icy_frame(
+        &fixture[..64 * 1024],
+        metaint,
+        &["{\"artist\":\"ВЛАДИМИР ТРОШИН\",\"name\":\"ЮНОСТЬ МОЯ\"}"],
+    );
+    let mut server = MockServer::start(vec![
+        Scenario::icy_stream(framed, metaint, "Говорит Севастополь"),
+        Scenario::silence(),
+    ]);
+
+    let buffer = RingBuffer::new(64 * 1024, 16 * 1024);
+    let stop = Arc::new(AtomicBool::new(false));
+    let budget = GarbageBudget::shared();
+    let link = Link::shared();
+    let net_status = net::SharedNetStatus::default();
+    let now_playing = sevfm::icy::SharedNowPlaying::default();
+    let ether_gate = sevfm::icy::SharedEtherGate::default();
+    let reader = net::spawn_reader(
+        server.url(),
+        buffer.clone(),
+        stop.clone(),
+        budget,
+        link,
+        net_status,
+        now_playing.clone(),
+        ether_gate.clone(),
+    )
+    .expect("поток reader'а запускается в тесте");
+
+    // Станция не ждёт звука: появляется по соединению, до любого чтения.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while now_playing
+        .lock()
+        .expect("замок эфира не отравлен: присваивание не паникует")
+        .station
+        .is_none()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "станция не появилась за 15 с без чтения"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Метаблок принят (аудио за ним записано в буфер), но его смещение
+    // 16 КиБ ещё не звучало: тики-дренажи публикацию не дают.
+    wait_for_available(&buffer, metaint + 1024);
+    common::play_chunk(&buffer, &ether_gate, &now_playing, 8 * 1024);
+    common::play_chunk(&buffer, &ether_gate, &now_playing, 0);
+    common::play_chunk(&buffer, &ether_gate, &now_playing, 0);
+    assert!(
+        now_playing
+            .lock()
+            .expect("замок эфира не отравлен: присваивание не паникует")
+            .track
+            .is_none(),
+        "трек не публикуется до звучания его аудио"
+    );
+
+    // Аудио до смещения «проиграно» — смена публикуется этим же тиком.
+    common::play_chunk(&buffer, &ether_gate, &now_playing, 8 * 1024);
+    let expected = Some(TrackInfo::Track {
+        artist: "ВЛАДИМИР ТРОШИН".to_owned(),
+        title: "ЮНОСТЬ МОЯ".to_owned(),
+    });
+    assert_eq!(
+        now_playing
+            .lock()
+            .expect("замок эфира не отравлен: присваивание не паникует")
+            .track,
+        expected,
+        "смена опубликована по прочтении аудио до смещения"
+    );
+
+    // Тики без чтения («буферизация») заголовок не меняют и не теряют.
+    common::play_chunk(&buffer, &ether_gate, &now_playing, 0);
+    assert_eq!(
+        now_playing
+            .lock()
+            .expect("замок эфира не отравлен: присваивание не паникует")
+            .track,
+        expected,
+        "остановка чтения замораживает заголовок"
+    );
+
+    stop.store(true, Ordering::SeqCst);
+    reader.join().expect("reader завершается по флагу");
+    server.stop();
+}
+
+/// Дожидается `want` доступных байтов в буфере (метаблок за порогом уже
+/// принят — очередь ворот точно непуста).
+fn wait_for_available(buffer: &RingBuffer, want: usize) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while buffer.available() < want {
+        assert!(
+            Instant::now() < deadline,
+            "данных {want} байтов не дождались: {}",
+            buffer.available()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Мусорное переподключение (очистка буфера) сбрасывает ворота эфира
+/// (спека icy-metadata, design add-ether-sync D5): ожидающая смена,
+/// чьё аудио выброшено очисткой, не публикуется даже когда позиция
+/// чтения проходит её смещение на новом соединении; публикуется трек
+/// первого метаблока нового соединения, когда его аудио «проиграно».
+#[test]
+fn garbage_reconnect_drops_pending_ether_changes() {
+    use sevfm::icy::TrackInfo;
+
+    let fixture = common::fixture_bytes();
+    let metaint = 8 * 1024;
+    let first = common::icy_frame(
+        &fixture[..32 * 1024],
+        metaint,
+        &["{\"artist\":\"ДО РАЗРЫВА\",\"name\":\"СТАРЫЙ ТРЕК\"}"],
+    );
+    let second = common::icy_frame(
+        &fixture[32 * 1024..96 * 1024],
+        metaint,
+        &["{\"artist\":\"ПОСЛЕ\",\"name\":\"НОВЫЙ ТРЕК\",\"type\":\"М\"}"],
+    );
+    // Оба соединения держатся: исход первого определяет тест (запрос
+    // переподключения), а не естественный обрыв.
+    let mut server = MockServer::start(vec![
+        Scenario::icy_paced_then_hold(
+            first,
+            8 * 1024,
+            Duration::from_millis(5),
+            metaint,
+            "Говорит Севастополь",
+        ),
+        Scenario::icy_paced_then_hold(
+            second,
+            8 * 1024,
+            Duration::from_millis(5),
+            metaint,
+            "Говорит Севастополь",
+        ),
+        Scenario::silence(),
+    ]);
+
+    let buffer = RingBuffer::new(64 * 1024, 16 * 1024);
+    let stop = Arc::new(AtomicBool::new(false));
+    let budget = GarbageBudget::shared();
+    let link = Link::shared();
+    let net_status = net::SharedNetStatus::default();
+    let now_playing = sevfm::icy::SharedNowPlaying::default();
+    let ether_gate = sevfm::icy::SharedEtherGate::default();
+    let reader = net::spawn_reader(
+        server.url(),
+        buffer.clone(),
+        stop.clone(),
+        budget,
+        link.clone(),
+        net_status,
+        now_playing.clone(),
+        ether_gate.clone(),
+    )
+    .expect("поток reader'а запускается в тесте");
+
+    // Метаблок первого соединения принят (смещение 8 КиБ), но не
+    // «проигран»: читаем только 4 КиБ — смена ждёт в воротах.
+    wait_for_available(&buffer, 2 * metaint);
+    common::play_chunk(&buffer, &ether_gate, &now_playing, 4 * 1024);
+    assert!(
+        now_playing
+            .lock()
+            .expect("замок эфира не отравлен: присваивание не паникует")
+            .track
+            .is_none(),
+        "смена до звучания её аудио не публикуется"
+    );
+
+    // Мусорный лимит декодера: буфер очищается, ворота сбрасываются.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while link.epoch() == 0 {
+        assert!(Instant::now() < deadline, "первое соединение не открылось");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    link.request_reconnect(link.epoch());
+    wait_for_connections(&server, 2);
+
+    // Позиция чтения проходит смещение сброшенной смены (8 КиБ) на аудио
+    // нового соединения — публикации нет: аудио старой смены выброшено.
+    common::play_chunk(&buffer, &ether_gate, &now_playing, 4 * 1024);
+    assert!(
+        now_playing
+            .lock()
+            .expect("замок эфира не отравлен: присваивание не паникует")
+            .track
+            .is_none(),
+        "сброшенная смена не публикуется после очистки буфера"
+    );
+
+    // Трек первого метаблока нового соединения (смещение 40 КиБ шкалы
+    // сессии) публикуется, когда «проиграно» аудио до него.
+    let expected = Some(TrackInfo::Track {
+        artist: "ПОСЛЕ".to_owned(),
+        title: "НОВЫЙ ТРЕК".to_owned(),
+    });
+    while now_playing
+        .lock()
+        .expect("замок эфира не отравлен: присваивание не паникует")
+        .track
+        != expected
+    {
+        assert!(
+            Instant::now() < deadline,
+            "трек нового соединения не наблюдался за 15 с"
+        );
+        common::play_chunk(&buffer, &ether_gate, &now_playing, 8 * 1024);
+    }
+
+    stop.store(true, Ordering::SeqCst);
+    reader.join().expect("reader завершается по флагу");
+    server.stop();
+}
+
+/// Краткий обрыв без очистки буфера не теряет ожидающую смену (спека
+/// icy-metadata, design add-ether-sync D5): смена, принятая до разрыва,
+/// публикуется, когда её аудио — всё ещё в буфере — «проиграно»; шкала
+/// аудиобайтов сессии непрерывна через переподключение.
+#[test]
+fn brief_drop_keeps_pending_ether_change() {
+    use sevfm::icy::TrackInfo;
+
+    let fixture = common::fixture_bytes();
+    let metaint = 8 * 1024;
+    // Блоки первого куска: 8К→трек1, 16К→трек2, 24К→трек1, 32К→трек2.
+    let first = common::icy_frame(
+        &fixture[..32 * 1024],
+        metaint,
+        &[
+            "{\"artist\":\"ПЕРВЫЙ\",\"name\":\"КУСОК ОДИН\"}",
+            "{\"artist\":\"ВТОРОЙ\",\"name\":\"ЖДЁТ РАЗРЫВА\"}",
+        ],
+    );
+    let rest = common::icy_frame(
+        &fixture[32 * 1024..96 * 1024],
+        metaint,
+        &["{\"artist\":\"ТРЕТИЙ\",\"name\":\"ПОСЛЕ ОБРЫВА\"}"],
+    );
+    let mut server = MockServer::start(vec![
+        Scenario::icy_stream(first, metaint, "Говорит Севастополь"),
+        Scenario::icy_stream(rest, metaint, "Говорит Севастополь"),
+        Scenario::silence(),
+    ]);
+
+    let buffer = RingBuffer::new(64 * 1024, 16 * 1024);
+    let stop = Arc::new(AtomicBool::new(false));
+    let budget = GarbageBudget::shared();
+    let link = Link::shared();
+    let net_status = net::SharedNetStatus::default();
+    let now_playing = sevfm::icy::SharedNowPlaying::default();
+    let ether_gate = sevfm::icy::SharedEtherGate::default();
+    let reader = net::spawn_reader(
+        server.url(),
+        buffer.clone(),
+        stop.clone(),
+        budget,
+        link,
+        net_status,
+        now_playing.clone(),
+        ether_gate.clone(),
+    )
+    .expect("поток reader'а запускается в тесте");
+
+    // «Проигрываем» 12 КиБ: опубликован только трек смещения 8 КиБ,
+    // смена смещения 16 КиБ ждёт в воротах.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut played = 0usize;
+    while played < 12 * 1024 {
+        assert!(Instant::now() < deadline, "первый кусок не дошёл за 15 с");
+        played += common::play_chunk(&buffer, &ether_gate, &now_playing, 12 * 1024 - played).len();
+    }
+    assert_eq!(
+        now_playing
+            .lock()
+            .expect("замок эфира не отравлен: присваивание не паникует")
+            .track,
+        Some(TrackInfo::Track {
+            artist: "ПЕРВЫЙ".to_owned(),
+            title: "КУСОК ОДИН".to_owned(),
+        }),
+        "прозвучавший трек опубликован"
+    );
+
+    // Первый кусок закончился — обрыв без очистки буфера, переподключение.
+    wait_for_connections(&server, 2);
+    // Аудио смены смещения 16 КиБ всё ещё в буфере (не выброшено):
+    // «проигрываем» его уже после разрыва — смена доезжает по звуку.
+    let mut played = 0usize;
+    while played < 8 * 1024 {
+        assert!(Instant::now() < deadline, "второй кусок не дошёл за 15 с");
+        played += common::play_chunk(&buffer, &ether_gate, &now_playing, 8 * 1024 - played).len();
+    }
+    assert_eq!(
+        now_playing
+            .lock()
+            .expect("замок эфира не отравлен: присваивание не паникует")
+            .track,
+        Some(TrackInfo::Track {
+            artist: "ВТОРОЙ".to_owned(),
+            title: "ЖДЁТ РАЗРЫВА".to_owned(),
+        }),
+        "смена, принятая до разрыва, опубликована по звуку после него"
+    );
+
+    // Хвост нового соединения публикуется как обычно.
+    let expected = Some(TrackInfo::Track {
+        artist: "ТРЕТИЙ".to_owned(),
+        title: "ПОСЛЕ ОБРЫВА".to_owned(),
+    });
+    while now_playing
+        .lock()
+        .expect("замок эфира не отравлен: присваивание не паникует")
+        .track
+        != expected
+    {
+        assert!(
+            Instant::now() < deadline,
+            "трек после обрыва не наблюдался за 15 с"
+        );
+        common::play_chunk(&buffer, &ether_gate, &now_playing, 8 * 1024);
+    }
+    assert_eq!(server.connections(), 2, "ровно одно переподключение");
 
     stop.store(true, Ordering::SeqCst);
     reader.join().expect("reader завершается по флагу");

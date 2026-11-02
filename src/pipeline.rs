@@ -32,10 +32,12 @@
 //! лимитом байтов и дедлайном: поток без единого валидного кадра — ошибка
 //! старта «не распознан как MP3» (код 2), а не вечный цикл.
 
+use std::collections::VecDeque;
 use std::io::Read;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::time::{Duration, Instant};
 
 use rodio::{ChannelCount, Sample, SampleRate, Source};
@@ -146,26 +148,71 @@ pub enum PipelineError {
     Io(String),
 }
 
-/// Источник PCM-сэмплов для rodio: symphonia поверх кольцевого буфера,
-/// который наполняет reader-поток (design D4: воспроизведение из буфера,
-/// а не напрямую из сети).
+/// Источник PCM-сэмплов для rodio (design D8 add-ether-sync): тонкий
+/// читатель сэмпл-FIFO декод-потока. Rodio 0.23 дёргает `next` прямо в
+/// аудио-колбэке устройства, поэтому `next` не блокируется никогда:
+/// голод FIFO (буферизация, обрыв сети) отдаёт равновесный сэмпл —
+/// тишину; разрыв FIFO (декод-поток завершён) — `None`, Player пустеет,
+/// живой цикл сессии классифицирует исход.
 ///
 /// Первый кадр декодируется в конструкторе — его формат становится
-/// форматом источника, поэтому rodio
-/// получает `channels`/`sample_rate` без дополнительной настройки.
-/// Дальнейшие кадры тянутся лениво по мере вывода.
+/// форматом источника, поэтому rodio получает `channels`/`sample_rate`
+/// без дополнительной настройки.
 pub struct Mp3Source {
+    /// Сэмпл-чанки кадров от декод-потока (чанк = кадр с меткой позиции).
+    fifo: Receiver<DecodedChunk>,
+    /// Текущий частично отданный чанк.
+    chunk: VecDeque<Sample>,
+    /// Позиция чтения тракта (аудиобайты) после декодирования кадра
+    /// текущего чанка: метка звучания, ставится в `sound_pos` при
+    /// исчерпании чанка — всё его аудио отдано устройству.
+    chunk_end: u64,
+    /// Позиция звучания в аудиобайтах (design D8): ставит потребитель
+    /// сэмплов при исчерпании чанка; ворота эфира дренируют по ней —
+    /// не по позиции декодера, который бежит впереди звука на полный FIFO.
+    sound_pos: Arc<AtomicU64>,
+    channels: ChannelCount,
+    sample_rate: SampleRate,
+    /// Итог для CLI: источник уезжает в rodio, своё поле недоступно.
+    shared_outcome: SharedOutcome,
+    /// Счётчик кадров декод-потока (диагностика и тесты).
+    packets: Arc<AtomicU64>,
+}
+
+/// Чанк сэмпл-FIFO: сэмплы одного кадра и позиция чтения тракта
+/// (аудиобайты, шкала кольца) после декодирования этого кадра — метка
+/// звучания для ворот эфира.
+struct DecodedChunk {
+    read_end: u64,
+    samples: Vec<Sample>,
+}
+
+/// Ёмкость сэмпл-FIFO в кадрах (~2 с звука при 48 кГц и 1152 сэмплах
+/// на кадр MP3): backpressure декодера — при полном FIFO поток ждёт
+/// потребителя; колбэк устройства от наполненности не зависит.
+/// На синхронность эфира ёмкость не влияет: ворота дренируют по
+/// `sound_pos` — позиции потребителя, а не декодера.
+const SAMPLE_FIFO_FRAMES: usize = 100;
+
+/// Тракт декодирования (design D8 add-ether-sync): probe, декодер и
+/// вся устойчивость к мусору — прежний тракт `Mp3Source`, вынесенный
+/// с аудио-колбэка в выделенный поток. Здесь блокироваться можно:
+/// underrun-пауза `BufferReader` — обычный sleep рабочего потока.
+struct DecodeTract {
     reader: Box<dyn FormatReader>,
     decoder: Box<dyn AudioDecoder>,
     track_id: u32,
+    /// Кольцо для наблюдения позиции чтения (метки чанков FIFO):
+    /// сами байты читает `BufferReader` внутри ридера.
+    ring: RingBuffer,
+    /// Сэмплы последнего декодированного кадра — уезжают в FIFO.
     buffer: Vec<Sample>,
-    buffer_offset: usize,
     channels: ChannelCount,
     sample_rate: SampleRate,
     budget: Arc<GarbageBudget>,
     stop: Arc<AtomicBool>,
     link: SharedLink,
-    /// Итог для CLI: источник уезжает в rodio, своё поле недоступно.
+    /// Итог для CLI: тракт уезжает в свой поток, своё поле недоступно.
     shared_outcome: SharedOutcome,
     /// Снимает лимит фазы поиска первым декодированным кадром
     /// (см. [`BufferReader`]).
@@ -182,7 +229,8 @@ pub struct Mp3Source {
     /// (классификация ошибки конструктора: «не распознан как MP3»).
     hit_search_limit: bool,
     outcome: Outcome,
-    packets: u64,
+    /// Счётчик кадров, общий с источником (getter `packets`).
+    packets: Arc<AtomicU64>,
 }
 
 /// Читатель кольцевого буфера для symphonia (`MediaSourceStream`):
@@ -289,6 +337,30 @@ impl Read for BufferReader {
     }
 }
 
+/// Пейсер чтения между `BufferReader` и symphonia (ревью add-ether-sync,
+/// P1 hunter/oracle): `MediaSourceStream` тянет блоками с удвоением до
+/// 32 КиБ — метка чанка `read_end = ring.total_read()` тогда опережает
+/// реально декодированную позицию на заполнение внутреннего кольца MSS
+/// (до ~1,5 с звука), и заголовок менялся бы раньше звука. Обрезка
+/// запроса до `PACED_READ_BYTES` держит кольцо MSS почти пустым:
+/// короткие чтения легальны (`io::Read`), refill честно берёт
+/// `actual_read_len` — упреждение меток ≤ ~2 КиБ ≈ 90 мс. Цена —
+/// ~10–20 лишних чтений в секунду, копеечная.
+struct PacedReader {
+    inner: BufferReader,
+}
+
+/// Порог пейсера: баланс упреждения меток (~90 мс при 22 КиБ/с потока)
+/// и числа чтений.
+const PACED_READ_BYTES: usize = 2 * 1024;
+
+impl Read for PacedReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let paced = out.len().min(PACED_READ_BYTES);
+        self.inner.read(&mut out[..paced])
+    }
+}
+
 /// Причина io-ошибки лимита фазы поиска: маркер опознаётся по цепочке
 /// symphonia (`io::Error` сохраняет вложенную причину для downcast) в
 /// любой точке тракта — probe, refill, вычитка мусора.
@@ -331,15 +403,16 @@ impl Mp3Source {
         stop: Arc<AtomicBool>,
         link: SharedLink,
         shared_outcome: SharedOutcome,
+        sound_pos: Arc<AtomicU64>,
     ) -> Result<Self, PipelineError> {
         // Probe и первый refill разбирают недоверенные данные: паника
         // symphonia возможна и здесь, не только в живом цикле (см.
-        // catch_unwind в `Iterator::next`). Без ловли crafted-MP3 убивает
+        // catch_unwind в `DecodeTract::run`). Без ловли crafted-MP3 убивает
         // процесс с кодом 101 вместо проектного «поток не распознан»
         // (код 2). AssertUnwindSafe: после паники частично построенный
         // тракт отбрасывается целиком, состояние никем не читается.
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            Self::new_inner(buffer, budget, stop, link, shared_outcome)
+            Self::build_and_spawn(buffer, budget, stop, link, shared_outcome, sound_pos)
         }))
         .unwrap_or_else(|_| {
             // Диагностика до классификации: сбой печати не отменяет исход.
@@ -350,20 +423,109 @@ impl Mp3Source {
         })
     }
 
-    /// Тело [`Self::new`] без защиты от паники (см. обёртку там же).
-    fn new_inner(
+    /// Тело [`Self::new`] без защиты от паники (см. обёртку там же):
+    /// строит тракт с первым кадром и запускает декод-поток.
+    fn build_and_spawn(
         buffer: RingBuffer,
         budget: Arc<GarbageBudget>,
         stop: Arc<AtomicBool>,
         link: SharedLink,
         shared_outcome: SharedOutcome,
+        sound_pos: Arc<AtomicU64>,
+    ) -> Result<Self, PipelineError> {
+        let packets: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let mut tract = DecodeTract::build(
+            buffer,
+            budget,
+            stop,
+            link,
+            shared_outcome.clone(),
+            packets.clone(),
+        )?;
+        // Первый кадр — формат источника и стартовый чанк FIFO с меткой
+        // позиции после его декодирования.
+        let channels = tract.channels;
+        let sample_rate = tract.sample_rate;
+        let first = DecodedChunk {
+            read_end: tract.ring.total_read(),
+            samples: std::mem::take(&mut tract.buffer),
+        };
+        let chunk_end = first.read_end;
+        let (sender, fifo) = sync_channel(SAMPLE_FIFO_FRAMES);
+        std::thread::Builder::new()
+            .name("mp3-decoder".into())
+            .spawn(move || tract.run(sender))
+            .map_err(|e| {
+                PipelineError::Io(format!("не удалось запустить поток декодирования: {e}"))
+            })?;
+        Ok(Self {
+            fifo,
+            chunk: first.samples.into(),
+            chunk_end,
+            sound_pos,
+            channels,
+            sample_rate,
+            shared_outcome,
+            packets,
+        })
+    }
+
+    /// Формат потока: (частота, каналы).
+    pub fn spec(&self) -> (u32, usize) {
+        (self.sample_rate.get(), self.channels.get() as usize)
+    }
+
+    /// Итог тракта: чем закончилось воспроизведение (слот пишет
+    /// декод-поток при терминальном исходе).
+    // Снаружи крейта не зовётся (только юнит-тесты): без `allow` не-тестовая
+    // сборка считает метод мёртвым кодом.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn outcome(&self) -> Outcome {
+        *self
+            .shared_outcome
+            .lock()
+            .expect("замок исхода не отравлен: присваивание не паникует")
+    }
+
+    /// Число декодированных кадров (для диагностики и тестов) — счётчик
+    /// декод-потока.
+    // Снаружи крейта не зовётся (только юнит-тесты): без `allow` не-тестовая
+    // сборка считает метод мёртвым кодом.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn packets(&self) -> u64 {
+        self.packets.load(Ordering::Relaxed)
+    }
+}
+
+impl DecodeTract {
+    /// Строит тракт поверх кольцевого буфера: probe (поиск sync-маркера,
+    /// радиопоток может начинаться посреди кадра) → формат-ридер →
+    /// декодер → первый кадр. `budget` сбрасывается после каждого успешно
+    /// декодированного кадра (мусорный бюджет reader'а, контракт
+    /// `net::GarbageBudget`); `stop` различает исчерпание данных
+    /// остановкой (`Outcome::Stopped`) от штатного конца; `link` — связка
+    /// с reader-потоком (запрос переподключения при мусорном лимите,
+    /// эпоха соединений); `shared_outcome` — слот финального исхода для
+    /// CLI; `packets` — общий с источником счётчик кадров.
+    fn build(
+        buffer: RingBuffer,
+        budget: Arc<GarbageBudget>,
+        stop: Arc<AtomicBool>,
+        link: SharedLink,
+        shared_outcome: SharedOutcome,
+        packets: Arc<AtomicU64>,
     ) -> Result<Self, PipelineError> {
         // Фаза поиска первого кадра: читатель ограничен лимитом (байты/
         // дедлайн), сигнал снимается первым декодированным кадром в refill.
         let first_frame: FirstFrameDecoded = Arc::new(AtomicBool::new(false));
-        let reader = BufferReader::new(buffer, stop.clone(), first_frame.clone());
+        // Кольцо уходит в BufferReader ридера; клон остаётся тракту —
+        // наблюдение позиции чтения для меток чанков FIFO. Между ридером
+        // и symphonia — пейсер: без него MSS тянет блоками до 32 КиБ и
+        // метки опережают декодер (см. PacedReader).
+        let reader = BufferReader::new(buffer.clone(), stop.clone(), first_frame.clone());
+        let paced = PacedReader { inner: reader };
         // Живой стрим не умеет Seek — оборачиваем в неseekable MediaSource.
-        let mss = MediaSourceStream::new(Box::new(ReadOnlySource::new(reader)), Default::default());
+        let mss = MediaSourceStream::new(Box::new(ReadOnlySource::new(paced)), Default::default());
         let reader = get_probe()
             .probe(
                 &Hint::new(),
@@ -407,8 +569,8 @@ impl Mp3Source {
             reader,
             decoder,
             track_id,
+            ring: buffer,
             buffer: Vec::new(), // заполняется первым кадром в refill()
-            buffer_offset: 0,
             channels: ChannelCount::new(1).expect("1 — допустимое число каналов"),
             sample_rate: SampleRate::new(1).expect("1 — допустимая частота"),
             budget,
@@ -422,7 +584,7 @@ impl Mp3Source {
             hit_garbage_limit: false,
             hit_search_limit: false,
             outcome: Outcome::Running,
-            packets: 0,
+            packets,
         };
         // Первый кадр — по тем же правилам устойчивости, что и весь
         // цикл: мусор пропускается до первого валидного кадра.
@@ -445,7 +607,7 @@ impl Mp3Source {
                     // ещё не было.
                     PipelineError::GarbageStream
                 } else {
-                    match source.outcome() {
+                    match source.outcome {
                         // Ошибка тракта до первого кадра — не «поток
                         // закончился» (задача 3.2: состояния различимы);
                         // детальная диагностика уже выведена в stderr.
@@ -460,22 +622,43 @@ impl Mp3Source {
         Ok(source)
     }
 
-    /// Формат потока: (частота, каналы).
-    pub fn spec(&self) -> (u32, usize) {
-        (self.sample_rate.get(), self.channels.get() as usize)
-    }
-
-    /// Итог источника: чем закончилось воспроизведение.
-    pub(crate) fn outcome(&self) -> Outcome {
-        self.outcome
-    }
-
-    /// Число декодированных кадров (для диагностики и тестов).
-    // Снаружи крейта не зовётся (только юнит-тесты): без `allow` не-тестовая
-    // сборка считает метод мёртвым кодом.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn packets(&self) -> u64 {
-        self.packets
+    /// Живой цикл декод-потока: кадры уходят в FIFO, пока тракт жив.
+    /// Выход — терминальный исход (`refill` вернул `false`, слот заполнен
+    /// и диагностика выведена) либо разрыв FIFO: источник отброшен
+    /// остановкой сессии, дальше писать некому.
+    fn run(mut self, fifo: SyncSender<DecodedChunk>) {
+        loop {
+            // Паника symphonia на недоверенных данных ловится — было в
+            // `Iterator::next`: погибший колбэк перестаёт опрашивать
+            // источник, `Player::empty` не опустеет и сессия зависла бы
+            // с тишиной. AssertUnwindSafe: после паники тракт отбрасывается,
+            // частично изменённое состояние никем не читается.
+            let frame = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.refill()));
+            match frame {
+                Ok(true) => {
+                    // Блокирующийся send — backpressure декодера: полный
+                    // FIFO ждёт потребителя. Ошибка — приёмник dropped.
+                    // Метка чанка — позиция чтения после декодирования кадра.
+                    let chunk = DecodedChunk {
+                        read_end: self.ring.total_read(),
+                        samples: std::mem::take(&mut self.buffer),
+                    };
+                    if fifo.send(chunk).is_err() {
+                        return;
+                    }
+                }
+                Ok(false) => return,
+                Err(_) => {
+                    // finish фиксирует исход до диагностики: сбой печати
+                    // не отменяет классификацию.
+                    self.finish(
+                        Outcome::DecoderError,
+                        "Паника тракта декодирования — воспроизведение будет остановлено",
+                    );
+                    return;
+                }
+            }
+        }
     }
 
     /// Тянет и декодирует следующий кадр в буфер сэмплов.
@@ -552,12 +735,13 @@ impl Mp3Source {
                     // Копируем сэмплы немедленно: `decoded` заимствует
                     // декодер, ссылки наружу не уходят. Буфер переиспользуем:
                     // copy_to_vec_interleaved делает resize на месте, а кадры
-                    // MP3 постоянного размера — аллокаций в цикле нет.
+                    // MP3 постоянного размера. Примечание D8: буфер
+                    // уезжает в FIFO через `mem::take` — аллокация на
+                    // кадр есть, capacity копией не переиспользуется.
                     let (rate, channels) =
                         (decoded.spec().rate(), decoded.spec().channels().count());
                     decoded.copy_to_vec_interleaved(&mut self.buffer);
-                    self.buffer_offset = 0;
-                    self.packets += 1;
+                    let packet_index = self.packets.fetch_add(1, Ordering::Relaxed);
                     // Кадр успешно декодирован — сброс мусорного бюджета
                     // reader'а (контракт `net::GarbageBudget`: счётчик
                     // байтов от последнего декодированного кадра); первый
@@ -571,7 +755,7 @@ impl Mp3Source {
                     // Формат источника задаётся первым кадром и дальше не
                     // меняется — как линия, открытая форматом первого
                     // кадра в LineAudioSink.
-                    if self.packets == 1 {
+                    if packet_index == 0 {
                         // Значения берутся из кадра в сети: неверное — ошибка
                         // тракта, а не паника. Для MP3 каналов ≤ 2 и частота
                         // из таблицы — ветка страховочная.
@@ -721,31 +905,30 @@ impl Iterator for Mp3Source {
 
     fn next(&mut self) -> Option<Sample> {
         loop {
-            if self.buffer_offset < self.buffer.len() {
-                let sample = self.buffer[self.buffer_offset];
-                self.buffer_offset += 1;
+            if let Some(sample) = self.chunk.pop_front() {
                 return Some(sample);
             }
-            // Кадр исчерпан — тянем следующий из буфера (сеть читает
-            // reader-поток, здесь только декодирование). Паника тракта
-            // (symphonia на недоверенных данных) ловится: погибший поток
-            // вывода rodio перестаёт опрашивать источник, `Player::empty`
-            // не опустеет и CLI завис бы с тишиной — вместо паники источник
-            // завершается штатно, слот исхода даёт код 2 (зеркально
-            // catch_unwind reader'а в `net::spawn_reader`).
-            // AssertUnwindSafe: после паники источник отбрасывается —
-            // частично изменённое состояние никем не читается.
-            let frame = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.refill()));
-            match frame {
-                Ok(true) => {}
-                Ok(false) => return None,
-                Err(_) => {
-                    // finish фиксирует исход до диагностики: сбой печати
-                    // не отменяет классификацию (код 2).
-                    self.finish(
-                        Outcome::DecoderError,
-                        "Паника тракта декодирования — воспроизведение будет остановлено",
-                    );
+            match self.fifo.try_recv() {
+                Ok(next) => {
+                    // Прошлый чанк отдан устройству целиком: звучание
+                    // дошло до его метки — позиция потребителя для ворот
+                    // эфира (design D8). Один store на чанк (~40/с),
+                    // не на сэмпл.
+                    self.sound_pos.store(self.chunk_end, Ordering::Relaxed);
+                    self.chunk = next.samples.into();
+                    self.chunk_end = next.read_end;
+                }
+                // Голод FIFO (буферизация, обрыв сети): тишина без
+                // блокировки — аудио-колбэк обязан вернуться вовремя,
+                // иначе устройство убивает поток (design D8). Равновесный
+                // сэмпл f32 — ноль (EQUILIBRIUM трейта dasp вне прямых
+                // зависимостей). Позиция звучания не двигается.
+                Err(TryRecvError::Empty) => return Some(0.0),
+                // Декод-поток завершён: терминальный исход уже в слоте,
+                // Player пустеет, живой цикл классифицирует. Финальный
+                // чанк зазвучал целиком — метка ставится.
+                Err(TryRecvError::Disconnected) => {
+                    self.sound_pos.store(self.chunk_end, Ordering::Relaxed);
                     return None;
                 }
             }
@@ -754,11 +937,11 @@ impl Iterator for Mp3Source {
 }
 
 impl Source for Mp3Source {
-    /// Полный размер текущего кадра, а не остаток (design D3): `Some(0)`
-    /// по контракту rodio означает «данных нет», и остаток давал бы
-    /// `Some(0)` на каждой межкадровой границе.
+    /// Рамка кадра источнику не видна — сэмплы идут чанками из FIFO
+    /// декод-потока: длина неопределённа. Rodio использует её только в
+    /// опциональных обёртках (queue/pausable), Player — нет.
     fn current_span_len(&self) -> Option<usize> {
-        Some(self.buffer.len())
+        None
     }
 
     fn channels(&self) -> ChannelCount {
@@ -812,7 +995,8 @@ mod tests {
     }
 
     /// То же с внешним флагом остановки (разделение терминальных
-    /// состояний).
+    /// состояний). Позиция звучания — отдельный атомик на тест (звук
+    /// никому не нужен, только контракт источника).
     fn source_over_with_stop(bytes: Vec<u8>, stop: Arc<AtomicBool>) -> Mp3Source {
         let buffer = RingBuffer::new(bytes.len().max(8 * 1024), 4 * 1024);
         buffer.write(&bytes).expect("ёмкости буфера хватает");
@@ -824,6 +1008,7 @@ mod tests {
             stop,
             Link::shared(),
             Arc::new(Mutex::new(Outcome::Running)),
+            Arc::new(AtomicU64::new(0)),
         )
         .expect("фикстура декодируется")
     }
@@ -838,10 +1023,13 @@ mod tests {
     }
 
     /// 3.2: фикстура живого среза декодируется до конца, ≥100 кадров.
+    /// Кратность сэмплов каналам после выноса декодирования в поток не
+    /// наблюдаема через `next` (design D8): при временно пустом FIFO
+    /// источник легитимно отдаёт тишину между чанками — инвариант
+    /// «кадр целиком» теперь держит структура FIFO (чанк = кадр).
     #[test]
     fn fixture_decodes_to_end_with_at_least_100_packets() {
         let mut source = source_over(fixture_bytes());
-        let (_, channels) = source.spec();
         let samples = drain(&mut source);
         assert_eq!(source.outcome(), Outcome::EndOfStream);
         assert!(
@@ -849,8 +1037,7 @@ mod tests {
             "кадров {} — слишком мало для 256 КБ потока",
             source.packets()
         );
-        // Сэмплы бьются по кадрам: кратно числу каналов.
-        assert_eq!(samples % channels as u64, 0, "кадры бьются по каналам");
+        assert!(samples > 0, "сэмплы есть");
     }
 
     /// Старт посреди кадра: фикстура записана с живого среза и начинается
@@ -901,6 +1088,7 @@ mod tests {
             stop,
             Link::shared(),
             Arc::new(Mutex::new(Outcome::Running)),
+            Arc::new(AtomicU64::new(0)),
         ) {
             Err(e) => e,
             Ok(_) => panic!("мусор не должен декодироваться"),
@@ -933,6 +1121,7 @@ mod tests {
             stop,
             Link::shared(),
             Arc::new(Mutex::new(Outcome::Running)),
+            Arc::new(AtomicU64::new(0)),
         ) {
             Err(e) => e,
             Ok(_) => panic!("поток без sync-маркеров не должен декодироваться"),
@@ -976,6 +1165,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             link,
             Arc::new(Mutex::new(Outcome::Running)),
+            Arc::new(AtomicU64::new(0)),
         ) {
             Err(e) => e,
             Ok(_) => panic!("авария reader'а не должна давать источник"),
@@ -1015,6 +1205,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             Link::shared(),
             Arc::new(Mutex::new(Outcome::Running)),
+            Arc::new(AtomicU64::new(0)),
         ) {
             Err(e) => e,
             Ok(_) => panic!("мусор без sync-маркеров не должен декодироваться"),
@@ -1094,6 +1285,7 @@ mod tests {
             stop,
             link,
             Arc::new(Mutex::new(Outcome::Running)),
+            Arc::new(AtomicU64::new(0)),
         ) {
             Err(e) => e,
             Ok(_) => panic!("фейковые кадры не должны декодироваться"),
@@ -1137,6 +1329,7 @@ mod tests {
             stop,
             Link::shared(),
             Arc::new(Mutex::new(Outcome::Running)),
+            Arc::new(AtomicU64::new(0)),
         ) {
             Err(PipelineError::GarbageStream) => {}
             Ok(mut source) => {
@@ -1206,6 +1399,7 @@ mod tests {
             stop,
             link,
             shared_outcome.clone(),
+            Arc::new(AtomicU64::new(0)),
         )
         .expect("валидный старт декодируется");
         let samples = drain(&mut source);
@@ -1275,6 +1469,7 @@ mod tests {
             stop,
             Link::shared(),
             Arc::new(Mutex::new(Outcome::Running)),
+            Arc::new(AtomicU64::new(0)),
         ) {
             Err(e) => e,
             Ok(_) => panic!("HTML не должен распознаваться как MP3"),
@@ -1288,32 +1483,270 @@ mod tests {
         );
     }
 
-    /// 3.1 (контракт rodio): `current_span_len` — полный размер текущего
-    /// кадра, а не остаток: на межкадровой границе (кадр только что
-    /// исчерпан) span не должен становиться `Some(0)` — `Some(0)` по
-    /// контракту значит «данных нет» (design D3).
+    /// Контракт rodio после выноса декодирования в поток (design D8):
+    /// рамка кадра источнику не видна — сэмплы идут чанками из FIFO,
+    /// `current_span_len` — всегда `None` (в т.ч. на межкадровой границе,
+    /// где прежний «остаток» давал бы запрещённый `Some(0)`).
     #[test]
-    fn span_len_is_full_frame_even_at_frame_boundary() {
+    fn span_len_is_none_samples_come_from_fifo() {
         let mut source = source_over(fixture_bytes());
         assert!(source.next().is_some(), "первый сэмпл есть");
-        let frame_len = source.current_span_len().expect("источник жив — span есть");
-        assert!(frame_len > 0, "кадр не пуст");
+        assert!(
+            source.current_span_len().is_none(),
+            "span неопределён — рамки кадров за FIFO"
+        );
+        // Граница кадра не меняет договора.
+        while source.next().is_some() && source.packets() < 3 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            source.current_span_len().is_none(),
+            "span неопределён и на границе кадров"
+        );
+    }
 
-        // Дошёвываем кадр до конца: на границе span обязан остаться
-        // равным полному размеру кадра, а не упасть в ноль.
-        for _ in 1..frame_len {
+    /// Регрессия P1 ревью (hunter + oracle): метки чанков не опережают
+    /// звук. Настоящий тракт над ICY-кадрированным потоком, метаблок на
+    /// смещении 16 КиБ: 25 кадров «звучания» (~10 КиБ) публикацию не дают,
+    /// 55 кадров (~21 КиБ) — дают. Без пейсера MSS вытягивал блок 16–32 КиБ
+    /// разом, первая метка перешагивала смещение и заголовок опережал
+    /// звук на секунды — тест ловил бы это на первом ассерте.
+    #[test]
+    fn metablock_publishes_by_sounding_not_by_decoder_readahead() {
+        use crate::icy::{EtherGate, SharedNowPlaying, TrackInfo};
+
+        let fixture = fixture_bytes();
+        let metaint = 16 * 1024;
+        // Три ауденокуска по metaint, после каждого — метаблок; гейт
+        // получает те же записи, что кладёт pump: смещение = аудиобайты,
+        // записанные до метаблока (шкала записи, метабайты в ней есть).
+        let mut framed = Vec::new();
+        let mut audio_written = 0u64;
+        let mut pushes = Vec::new();
+        for piece in 0..3 {
+            framed.extend_from_slice(&fixture[piece * metaint..(piece + 1) * metaint]);
+            audio_written += metaint as u64;
+            pushes.push(audio_written);
+            let mut content = "StreamTitle='{\"artist\":\"АРТИСТ\",\"name\":\"ТРЕК\"}';"
+                .as_bytes()
+                .to_vec();
+            while !content.len().is_multiple_of(16) {
+                content.push(0);
+            }
+            framed.push(u8::try_from(content.len() / 16).expect("≤ 4080 байтов"));
+            framed.extend_from_slice(&content);
+        }
+        let buffer = RingBuffer::new(128 * 1024, 4 * 1024);
+        buffer.write(&framed).expect("поток влезает в кольцо");
+        let gate = EtherGate::default();
+        for offset in pushes {
+            gate.push(
+                offset,
+                TrackInfo::Track {
+                    artist: "АРТИСТ".to_owned(),
+                    title: "ТРЕК".to_owned(),
+                },
+            );
+        }
+        let now_playing: SharedNowPlaying = Default::default();
+        let sound_pos = Arc::new(AtomicU64::new(0));
+        let mut source = Mp3Source::new(
+            buffer.clone(),
+            GarbageBudget::shared(),
+            Arc::new(AtomicBool::new(false)),
+            Link::shared(),
+            Arc::new(Mutex::new(Outcome::Running)),
+            sound_pos.clone(),
+        )
+        .expect("фикстура — валидный MP3");
+
+        // Публикация — те же шаги, что tick() сессии: позиция звучания
+        // от потребителя, дренаж — по ней.
+        let drain = |now_playing: &SharedNowPlaying| {
+            if let Some(track) = gate.drain_until(sound_pos.load(Ordering::Relaxed)) {
+                now_playing
+                    .lock()
+                    .expect("замок эфира не отравлен: присваивание не паникует")
+                    .track = Some(track);
+            }
+        };
+        let track_now = || {
+            now_playing
+                .lock()
+                .expect("замок эфира не отравлен: присваивание не паникует")
+                .track
+                .clone()
+        };
+        let mut sounded = 0usize; // сэмплов отдано потребителю
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let play = |source: &mut Mp3Source, sounded: &mut usize, frames: usize| {
+            // В тесте next() не привязан к часам устройства: тишиной можно
+            // «прозвучать» кадры, которых декодер ещё не выдал. Ждём запаса
+            // декодированных кадров, затем потребляем ровно frames кадров.
+            while source.packets() < frames as u64 + 10 {
+                assert!(
+                    Instant::now() < deadline,
+                    "декодер не продвигается: {} кадров",
+                    source.packets()
+                );
+                let _ = source.next();
+            }
+            while *sounded < frames * 2304 {
+                assert!(source.next().is_some());
+                *sounded += 1;
+            }
+            drain(&now_playing);
+        };
+
+        // ~10 КиБ звука — смещение 16 КиБ ещё не настало (допуск пейсера
+        // ~2 КиБ в сторону опережения).
+        play(&mut source, &mut sounded, 25);
+        assert!(
+            track_now().is_none(),
+            "метаблок не публикуется до звучания его аудио"
+        );
+
+        // ~21 КиБ звука — смещение пройдено, публикация состоялась.
+        play(&mut source, &mut sounded, 55);
+        assert_eq!(
+            track_now(),
+            Some(TrackInfo::Track {
+                artist: "АРТИСТ".to_owned(),
+                title: "ТРЕК".to_owned(),
+            }),
+            "метаблок опубликован по звучании аудио до его смещения"
+        );
+
+        // Граница опережения (главный ассерт пейсера): метка потреблённого
+        // чанка не может обгонять декодер больше, чем на окно пейсера.
+        // Без пейсера MSS к этому моменту вытянул бы блоками ~63 КиБ и
+        // метка указывала бы на позицию вдвое дальше звучащей.
+        play(&mut source, &mut sounded, 85);
+        // Бюджет: probe + кадры (384 Б/кадр фикстуры) + четыре окна пейсера
+        // (2 КиБ упреждение чтения + метабайты и resync-мусор вокруг них —
+        // метаблок рвёт кадр, хвост пропускается как мусор). Без пейсера
+        // метка здесь указывала бы на ~63 КиБ — вдвое дальше звучащего.
+        let sounded_bytes = 35 + 86 * 384;
+        // Бюджет — литеральные 8 КиБ (не кратен константе пейсера: иначе
+        // проверка сама раздувается вместе с отключённым пейсером).
+        const LEAD_BUDGET_BYTES: u64 = 8 * 1024;
+        assert!(
+            sound_pos.load(Ordering::Relaxed) <= sounded_bytes as u64 + LEAD_BUDGET_BYTES,
+            "метка обгоняет декодер дальше окна пейсера: sound_pos={}, звучит ~{}",
+            sound_pos.load(Ordering::Relaxed),
+            sounded_bytes
+        );
+
+        // Конец потока — исход штатный.
+        buffer.close();
+        while source.next().is_some() {}
+        assert_eq!(source.outcome(), Outcome::EndOfStream);
+    }
+
+    /// Декод-поток и сэмпл-FIFO (design D8/D9): голод (underrun-пауза с
+    /// открытым буфером — модель долгого обрыва сети) не блокирует `next`
+    /// — источник отдаёт тишину (аудио-колбэк обязан возвращаться
+    /// мгновенно, на его блокировке стоял ложный Fatal «аудиоустройство»);
+    /// подача данных возобновляет декодирование; закрытие буфера завершает
+    /// источник, исход — в слоте.
+    #[test]
+    fn starved_source_yields_silence_then_resumes_and_ends() {
+        let bytes = fixture_bytes();
+        let head = bytes[..16 * 1024].to_vec();
+        let tail = bytes[16 * 1024..48 * 1024].to_vec();
+        let buffer = RingBuffer::new(64 * 1024, 8 * 1024);
+        buffer.write(&head).expect("голова влезает");
+        // Буфер ОТКРЫТ: после исчерпания головы тракт уйдёт в underrun-паузу.
+        let stop = Arc::new(AtomicBool::new(false));
+        let budget = GarbageBudget::shared();
+        let link = crate::net::Link::shared();
+        let shared_outcome: SharedOutcome = Arc::new(Mutex::new(Outcome::Running));
+        let sound_pos = Arc::new(AtomicU64::new(0));
+        let mut source = Mp3Source::new(
+            buffer.clone(),
+            budget,
+            stop,
+            link,
+            shared_outcome.clone(),
+            sound_pos.clone(),
+        )
+        .expect("фикстура — валидный MP3");
+
+        // Дожидаемся паузы: флаг ставит BufferReader декод-потока (~500 мс
+        // после исчерпания данных — таймаут одного чтения).
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !buffer.is_underrun() {
+            assert!(Instant::now() < deadline, "underrun-пауза не наступила");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Вычитываем FIFO до тишины: 4 кадра нулей подряд (4608 сэмплов) —
+        // гарантированный признак голода, не нули внутри музыки.
+        let mut zeros = 0usize;
+        while zeros < 4608 {
+            match source.next() {
+                Some(0.0) => zeros += 1,
+                Some(_) => zeros = 0,
+                None => panic!("источник завершился посреди голода"),
+            }
+        }
+
+        // Голод: `next` отдаёт тишину и НЕ блокируется; позиция звучания
+        // заморожена — тишина поток не двигает (ворота эфира стоят).
+        let frozen = sound_pos.load(Ordering::Relaxed);
+        let started = Instant::now();
+        for _ in 0..10_000 {
+            assert_eq!(source.next(), Some(0.0), "голод — равновесный сэмпл");
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "next не блокируется на голоде: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            sound_pos.load(Ordering::Relaxed),
+            frozen,
+            "тишина не двигает позицию звучания"
+        );
+
+        // Возобновление: хвост данных выводит тракт из паузы; потреблённые
+        // чанки двигают позицию звучания.
+        buffer.write(&tail).expect("хвост влезает");
+        let packets_before = source.packets();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while source.packets() == packets_before {
+            assert!(Instant::now() < deadline, "декодирование не возобновилось");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        while sound_pos.load(Ordering::Relaxed) <= frozen {
             assert!(
-                source.next().is_some(),
-                "сэмплы текущего кадра исчерпываются не раньше frame_len"
+                Instant::now() < deadline,
+                "позиция звучания не двигается после возобновления"
+            );
+            let _ = source.next();
+        }
+
+        // Конец: закрытие буфера — тракт завершается, FIFO исчерпывается,
+        // `next` возвращает None, исход — в слоте, потребитель догнал
+        // тракт (позиция звучания == позиция чтения декодера).
+        buffer.close();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while source.next().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "источник не завершился после close"
             );
         }
         assert_eq!(
-            source.current_span_len(),
-            Some(frame_len),
-            "на межкадровой границе span — полный кадр, не Some(0)"
+            *shared_outcome
+                .lock()
+                .expect("замок исхода не отравлен: присваивание не паникует"),
+            Outcome::EndOfStream
         );
-        // Данные при этом есть: следующий кадр отдаётся.
-        assert!(source.next().is_some(), "следующий кадр читается");
+        assert!(
+            buffer.total_read() - sound_pos.load(Ordering::Relaxed) <= 2 * PACED_READ_BYTES as u64,
+            "потребитель догнал тракт в конце потока (разница только хвост пейсера)"
+        );
     }
 
     /// 3.1 (underrun): `BufferReader` при исчерпании данных ждёт

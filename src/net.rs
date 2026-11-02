@@ -426,7 +426,9 @@ impl PlaybackStatus {
 /// Сводит сетевое состояние и состояние буфера в статус воспроизведения.
 /// `playback_started` — звук уже запускался; `decoder_paused` — декодер
 /// в underrun-паузе (буфер опустошался и ждёт повторного предбуфера —
-/// точный признак паузы звука, а не «буфер почти пуст, но звук идёт»).
+/// пауза ДЕКОДЕРА: после D8 звук ещё доигрывает сэмпл-FIFO до ~2,4 с,
+/// статус появляется чуть раньше фактической тишины; «буфер почти пуст,
+/// но звук идёт» — это другое состояние).
 pub fn playback_status(
     net: NetStatus,
     playback_started: bool,
@@ -459,6 +461,7 @@ pub fn playback_status(
 /// Паника внутри потока ловится: буфер закрывается (декодер дочитывает и
 /// завершается, а не ждёт данные вечно), диагностику печатает стандартный
 /// panic-хук; финальную классификацию выхода CLI делает по смерти потока.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_reader(
     url: String,
     buffer: RingBuffer,
@@ -467,6 +470,7 @@ pub fn spawn_reader(
     link: SharedLink,
     net_status: SharedNetStatus,
     now_playing: icy::SharedNowPlaying,
+    ether_gate: icy::SharedEtherGate,
 ) -> std::io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("net-reader".into())
@@ -483,6 +487,7 @@ pub fn spawn_reader(
                     &link,
                     &net_status,
                     &now_playing,
+                    &ether_gate,
                 )
             }));
             if result.is_err() {
@@ -507,6 +512,7 @@ struct ReaderState {
 }
 
 /// Главный цикл: подключение → перекачка → backoff → повтор.
+#[allow(clippy::too_many_arguments)]
 fn reader_loop(
     url: &str,
     buffer: &RingBuffer,
@@ -515,11 +521,18 @@ fn reader_loop(
     link: &Link,
     net_status: &SharedNetStatus,
     now_playing: &icy::SharedNowPlaying,
+    ether_gate: &icy::EtherGate,
 ) {
     let mut state = ReaderState {
         backoff_index: 0,
         had_connection: false,
     };
+    // Кумулятивные аудиобайты сессии (design add-ether-sync D1): шкала
+    // смещений метаблоков в воротах эфира. Живёт сессию, переподключения
+    // не сбрасывают — позиция чтения из буфера монотонна так же. Счётчик
+    // мусорного бюджета (`audio_bytes` в `pump`) живёт одно соединение,
+    // это разные счётчики.
+    let mut session_audio: u64 = 0;
     // Флаг остановки: запись SeqCst (обработчик сигнала/тесты), чтение
     // здесь и в тракте — тем же порядком, без смеси.
     while !stop.load(Ordering::SeqCst) {
@@ -548,28 +561,33 @@ fn reader_loop(
                 match pump(
                     &mut opened.body,
                     &mut framer,
-                    now_playing,
+                    ether_gate,
                     buffer,
                     stop,
                     link,
                     budget,
                     net_status,
                     &mut state,
+                    &mut session_audio,
                 ) {
                     PumpOutcome::Stopped | PumpOutcome::BufferClosed => return,
                     PumpOutcome::GarbageLimit => {
                         // Мусор декодера не сшиваем со свежим потоком:
                         // буфер очищается, новое соединение начнётся с
-                        // чистого выравнивания кадров.
+                        // чистого выравнивания кадров. Ожидающие смены
+                        // трека привязаны к выброшенному аудио — ворота
+                        // сбрасываются (design add-ether-sync D5).
                         buffer.clear();
+                        ether_gate.reset();
                         crate::say("мусорный лимит декодера — соединение закрывается");
                         set_net_status(net_status, state.had_connection);
                     }
                     PumpOutcome::GarbageBudget(reason) => {
                         // Мусор мёртвого соединения не сшиваем со свежим
                         // потоком: очищается, как при мусорном лимите
-                        // декодера.
+                        // декодера, ворота эфира — вместе с буфером.
                         buffer.clear();
+                        ether_gate.reset();
                         crate::say(&reason);
                         set_net_status(net_status, state.had_connection);
                     }
@@ -667,18 +685,20 @@ fn is_read_timeout(e: &std::io::Error) -> bool {
 
 /// Читает сокет и пишет в буфер, пока соединение живо. Между сокетом и
 /// буфером — ICY-кадрировщик (design D2 фазы ICY): декодер получает
-/// только аудиобайты, метаблоки уходят в парсер трека.
+/// только аудиобайты, метаблоки уходят в парсер трека и ворота эфира —
+/// трек публикуется звуком, не приёмом (design add-ether-sync D1).
 #[allow(clippy::too_many_arguments)]
 fn pump(
     body: &mut dyn Read,
     framer: &mut icy::IcyFramer,
-    now_playing: &icy::SharedNowPlaying,
+    ether_gate: &icy::EtherGate,
     buffer: &RingBuffer,
     stop: &AtomicBool,
     link: &Link,
     budget: &GarbageBudget,
     net_status: &SharedNetStatus,
     state: &mut ReaderState,
+    session_audio: &mut u64,
 ) -> PumpOutcome {
     let mut chunk = vec![0u8; READ_CHUNK];
     let mut last_progress = Instant::now();
@@ -755,6 +775,7 @@ fn pump(
                 framer.push(&chunk[..n], &mut |frame| match frame {
                     icy::Frame::Audio(seg) => {
                         audio_bytes += seg.len();
+                        *session_audio += seg.len() as u64;
                         if !buffer_closed && buffer.write(seg).is_err() {
                             buffer_closed = true;
                         }
@@ -762,10 +783,10 @@ fn pump(
                     icy::Frame::Meta(block) => {
                         meta_window_bytes += block.len();
                         if let Some(track) = icy::parse_meta(&block) {
-                            let mut ether = now_playing
-                                .lock()
-                                .expect("замок эфира не отравлен: присваивание не паникует");
-                            ether.track = Some(track);
+                            // В очередь со смещением всего аудио, записанного
+                            // до метаблока: трек относится к аудио ПОСЛЕ
+                            // него (design add-ether-sync D1).
+                            ether_gate.push(*session_audio, track);
                         }
                     }
                 });

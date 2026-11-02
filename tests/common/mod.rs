@@ -519,3 +519,37 @@ pub fn fixture_bytes() -> Vec<u8> {
     assert!(!bytes.is_empty(), "фикстура не пуста");
     bytes
 }
+
+/// «Проигрывает» порцию аудио для ворот эфира (design add-ether-sync D7):
+/// читает из буфера до `bytes` байтов порциями (доступное без ожидания
+/// накопления, как декодер у живого потока; сухое чтение завершает порцию)
+/// и дренирует ворота по позиции чтения — те же шаги, что `tick()` сессии
+/// делает для потребителя. Возвращает прочитанные байты.
+pub fn play_chunk(
+    buffer: &sevfm::buffer::RingBuffer,
+    ether_gate: &sevfm::icy::EtherGate,
+    now_playing: &sevfm::icy::SharedNowPlaying,
+    bytes: usize,
+) -> Vec<u8> {
+    let mut played = Vec::with_capacity(bytes);
+    let mut sink = vec![0u8; 4 * 1024];
+    while played.len() < bytes {
+        let want = (bytes - played.len()).min(sink.len());
+        match buffer.read(&mut sink[..want], Duration::from_millis(100)) {
+            Ok(n) => played.extend_from_slice(&sink[..n]),
+            // Сухое чтение: порция воспроизведения закончена — дренируем
+            // то, что прочитано (пустое чтение позицию звука не двигает).
+            Err(sevfm::buffer::ReadError::Timeout) => break,
+            Err(sevfm::buffer::ReadError::Closed) => {
+                panic!("буфер закрыт раньше конца воспроизведения")
+            }
+        }
+    }
+    if let Some(track) = ether_gate.drain_until(buffer.total_read()) {
+        now_playing
+            .lock()
+            .expect("замок эфира не отравлен: присваивание не паникует")
+            .track = Some(track);
+    }
+    played
+}
