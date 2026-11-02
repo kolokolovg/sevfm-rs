@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sevfm — плеер онлайн-радио «Говорит Севастополь»</title>
+<meta name="description" content="sevfm (sevfm-rs) — легковесный настольный плеер онлайн-радио «Говорит Севастополь» на Rust + Slint: живой MP3-стрим без обрывов, ICY-метаданные эфира, нативный интерфейс.">
+<meta property="og:title" content="sevfm — плеер онлайн-радио «Говорит Севастополь»">
+<meta property="og:description" content="Легковесный настольный плеер на Rust + Slint: живой MP3-стрим без обрывов, метаданные эфира, нативный интерфейс.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://kolokolovg.github.io/sevfm-rs/">
+<link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-row">
+    <a class="brand" href="#top"><span class="brand-note" aria-hidden="true">♪</span> sevfm</a>
+    <nav class="site-nav">
+      <a href="#features">Возможности</a>
+      <a href="#pipeline">Тракт</a>
+      <a href="#status">Статус</a>
+      <a href="#build">Сборка</a>
+      <a class="nav-gh" href="https://github.com/kolokolovg/sevfm-rs">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+
+<!-- ═══════════════ HERO ═══════════════ -->
+<section class="hero">
+  <div class="container hero-grid">
+    <div class="hero-text">
+      <h1>sevfm</h1>
+      <p class="hero-sub">Легковесный настольный плеер онлайн-радио
+        <a href="https://sevfm.ru">«Говорит Севастополь»</a>.</p>
+      <ul class="badges" aria-label="Ключевые факты">
+        <li>Rust · edition 2024</li>
+        <li>Apache-2.0</li>
+        <li>Linux-десктоп</li>
+        <li>v0.1.0</li>
+      </ul>
+      <p class="hero-note">Нативный бинарник с малым потреблением памяти —
+        целевой ориентир: десятки МБ RSS. Живой MP3-стрим, устойчивый к обрывам
+        сети, и метаданные эфира: станция и текущий трек.</p>
+      <div class="cta-row">
+        <a class="btn btn-primary" href="https://github.com/kolokolovg/sevfm-rs">
+          Исходники на GitHub</a>
+        <a class="btn btn-ghost" href="#build">Как собрать</a>
+      </div>
+    </div>
+
+    <!-- Макет окна плеера: реставрация ui/player-window.slint -->
+    <figure class="window-wrap">
+      <div class="window" role="img"
+           aria-label="Макет окна плеера: обложка, станция, статус, трек и кнопки «Играть» и «Стоп»">
+        <div class="window-titlebar">
+          <span class="dot" aria-hidden="true"></span>
+          <span class="dot" aria-hidden="true"></span>
+          <span class="dot" aria-hidden="true"></span>
+          <span class="window-title">Говорит Севастополь</span>
+        </div>
+        <div class="window-body">
+          <div class="cover"><span aria-hidden="true">♪</span></div>
+          <div class="w-station">Говорит Севастополь</div>
+          <div class="w-status"><span class="pulse" aria-hidden="true"></span>Воспроизведение</div>
+          <div class="w-track">
+            <div class="w-artist">ИСПОЛНИТЕЛЬ</div>
+            <div class="w-title">Название трека</div>
+          </div>
+          <div class="w-controls">
+            <button class="w-btn w-btn-play" type="button" tabindex="-1">Играть</button>
+            <button class="w-btn" type="button" tabindex="-1">Стоп</button>
+          </div>
+        </div>
+      </div>
+      <figcaption>Макет окна плеера — по макету <code>ui/player-window.slint</code></figcaption>
+    </figure>
+  </div>
+</section>
+
+<!-- ═══════════════ ВОЗМОЖНОСТИ ═══════════════ -->
+<section id="features" class="section">
+  <div class="container">
+    <h2>Возможности</h2>
+    <div class="cards">
+      <article class="card">
+        <h3>Стрим без обрывов</h3>
+        <p>Звук играется из кольцевого буфера на 512&nbsp;КиБ с предбуфером
+          64&nbsp;КиБ: при обрыве сети воспроизведение продолжается, пока есть
+          данные. Долгий обрыв — пауза с автоматическим возобновлением.</p>
+      </article>
+      <article class="card">
+        <h3>Автопереподключение</h3>
+        <p>Соединение восстанавливается с нарастающей задержкой
+          1&nbsp;→&nbsp;2&nbsp;→&nbsp;5&nbsp;→&nbsp;10&nbsp;с. Сетевые ошибки и
+          «капающий» сервер (ниже 2&nbsp;КиБ/с) не завершают плеер — только
+          переподключения с логом.</p>
+      </article>
+      <article class="card">
+        <h3>Метаданные эфира (ICY)</h3>
+        <p>При подключении запрашиваются ICY-метаданные; блоки вырезаются из
+          потока до декодера — звук идёт без искажений. В эфире видно название
+          станции и строку «ИСПОЛНИТЕЛЬ — НАЗВАНИЕ» при каждой смене трека.</p>
+      </article>
+      <article class="card">
+        <h3>Легковесность</h3>
+        <p>Нативный бинарник на Rust с UI на Slint (render-on-demand):
+          интерфейс перерисовывается только по изменению состояния. Цель —
+          десятки МБ RSS и минимальная нагрузка на процессор.</p>
+      </article>
+      <article class="card">
+        <h3>Устойчивость к мусору</h3>
+        <p>Битые кадры логируются не чаще раза в секунду, мусор в потоке
+          лечится переподключением. Коды выхода строги: 0 — штатно, 2 —
+          фатальные ошибки старта или живого цикла.</p>
+      </article>
+      <article class="card">
+        <h3>Headless-режим</h3>
+        <p>Флаг <code>--headless</code> запускает тракт без окна: статусы
+          «Подключение», «Воспроизведение», «Переподключение», «Буферизация»
+          идут в stderr. Остановка — Ctrl+C или SIGTERM, выход за секунду.</p>
+      </article>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════ АУДИО-ТРАКТ ═══════════════ -->
+<section id="pipeline" class="section section-alt">
+  <div class="container">
+    <h2>Аудио-тракт</h2>
+    <p class="section-lead">Сетевое чтение живёт в выделенном потоке и не
+      блокирует вывод; ICY-метаблоки вырезаются до декодера.</p>
+    <ol class="flow" aria-label="Схема аудио-тракта">
+      <li class="flow-node">
+        <span class="flow-num">1</span>
+        <span class="flow-name">Сеть</span>
+        <span class="flow-desc">ureq · HTTP/TLS</span>
+      </li>
+      <li class="flow-arrow" aria-hidden="true">→</li>
+      <li class="flow-node">
+        <span class="flow-num">2</span>
+        <span class="flow-name">Кольцевой буфер</span>
+        <span class="flow-desc">512 КиБ · предбуфер 64 КиБ</span>
+      </li>
+      <li class="flow-arrow" aria-hidden="true">→</li>
+      <li class="flow-node">
+        <span class="flow-num">3</span>
+        <span class="flow-name">Декодер</span>
+        <span class="flow-desc">symphonia · покадровый MP3</span>
+      </li>
+      <li class="flow-arrow" aria-hidden="true">→</li>
+      <li class="flow-node">
+        <span class="flow-num">4</span>
+        <span class="flow-name">Вывод</span>
+        <span class="flow-desc">rodio / cpal · PCM</span>
+      </li>
+    </ol>
+  </div>
+</section>
+
+<!-- ═══════════════ СТАТУС ═══════════════ -->
+<section id="status" class="section">
+  <div class="container">
+    <h2>Статус и план</h2>
+    <ul class="timeline">
+      <li class="tl-item done">
+        <span class="tl-badge" aria-hidden="true">✓</span>
+        <div><h3>Аудио-тракт живого MP3-стрима</h3>
+          <p>Буфер, декодер, устойчивость к мусору и обрывам, остановка по
+            сигналу.</p></div>
+      </li>
+      <li class="tl-item done">
+        <span class="tl-badge" aria-hidden="true">✓</span>
+        <div><h3>ICY-метаданные эфира</h3>
+          <p>Название станции и текущий трек из ICY-метаблоков.</p></div>
+      </li>
+      <li class="tl-item done">
+        <span class="tl-badge" aria-hidden="true">✓</span>
+        <div><h3>Окно плеера на Slint</h3>
+          <p>«Играть» / «Стоп», статусы, повторные сессии, headless-флаг.</p></div>
+      </li>
+      <li class="tl-item wip">
+        <span class="tl-badge" aria-hidden="true">…</span>
+        <div><h3>Обложки треков <em class="tl-tag">в работе</em></h3>
+          <p>Цепочка публичных сервисов без API-ключей: iTunes → Deezer →
+            Яндекс.Музыка, первый найденный результат побеждает; локальный кеш.</p></div>
+      </li>
+      <li class="tl-item plan">
+        <span class="tl-badge" aria-hidden="true">◦</span>
+        <div><h3>Свёртывание в трей <em class="tl-tag">запланировано</em></h3>
+          <p>Фоновая работа через <code>tray-icon</code>.</p></div>
+      </li>
+      <li class="tl-item plan">
+        <span class="tl-badge" aria-hidden="true">◦</span>
+        <div><h3>Синхронизация метаданных с звучащим аудио <em class="tl-tag">запланировано</em></h3>
+          <p>Очередь метаблоков с привязкой к аудиосмещению: трек меняется
+            в момент, когда он действительно звучит.</p></div>
+      </li>
+    </ul>
+    <p class="section-lead">Поведение зафиксировано спецификациями в
+      <a href="https://github.com/kolokolovg/sevfm-rs/tree/main/openspec">openspec</a>.</p>
+  </div>
+</section>
+
+<!-- ═══════════════ СБОРКА ═══════════════ -->
+<section id="build" class="section section-alt">
+  <div class="container">
+    <h2>Сборка и запуск</h2>
+    <div class="build-grid">
+      <div class="code-card">
+        <h3>Сборка</h3>
+<pre><code>cargo build --release</code></pre>
+      </div>
+      <div class="code-card">
+        <h3>Запуск</h3>
+<pre><code>cargo run --release                    # станция по умолчанию (sevfm.ru)
+cargo run --release -- &lt;URL-стрима&gt;    # произвольный живой MP3-поток
+cargo run --release -- --headless     # тракт без окна</code></pre>
+      </div>
+    </div>
+    <p class="section-lead">Живые тесты (требуют сеть; SIGINT-тест — ещё и
+      аудиоустройство):</p>
+    <div class="code-card">
+<pre><code>cargo test live_stream_reads_first_64k -- --ignored --nocapture
+cargo test --test sigint_live -- --ignored</code></pre>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════ ТЕХНОЛОГИИ ═══════════════ -->
+<section id="stack" class="section">
+  <div class="container">
+    <h2>Технологии и лицензии</h2>
+    <ul class="chips">
+      <li><strong>Rust</strong><span>edition 2024</span></li>
+      <li><strong>Slint</strong><span>UI, render-on-demand</span></li>
+      <li><strong>ureq</strong><span>HTTP/TLS</span></li>
+      <li><strong>symphonia</strong><span>MP3-декодер</span></li>
+      <li><strong>rodio / cpal</strong><span>аудиовыход</span></li>
+      <li><strong>ctrlc</strong><span>обработка сигналов</span></li>
+    </ul>
+    <p class="section-lead">Лицензия — Apache&nbsp;License&nbsp;2.0:
+      <a href="https://github.com/kolokolovg/sevfm-rs/blob/main/LICENSE">LICENSE</a> и
+      <a href="https://github.com/kolokolovg/sevfm-rs/blob/main/NOTICE">NOTICE</a>.
+      Сторонние компоненты —
+      <a href="https://github.com/kolokolovg/sevfm-rs/blob/main/THIRD-PARTY-NOTICES.md">THIRD-PARTY-NOTICES.md</a>.</p>
+  </div>
+</section>
+
+</main>
+
+<footer class="site-footer">
+  <div class="container footer-row">
+    <p><span class="brand-note" aria-hidden="true">♪</span> sevfm v0.1.0 ·
+      порт <abbr title="оригинальная версия плеера на Java">Java-версии</abbr> ·
+      автор — Gleb Kolokolov</p>
+    <p class="footer-links">
+      <a href="https://github.com/kolokolovg/sevfm-rs">GitHub</a>
+      <a href="https://github.com/kolokolovg/sevfm-rs/issues">Issues</a>
+      <a href="https://sevfm.ru">Радио «Говорит Севастополь»</a>
+    </p>
+  </div>
+</footer>
+
+</body>
+</html>
