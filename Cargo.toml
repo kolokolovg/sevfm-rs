@@ -77,6 +77,16 @@ mpris-server = { version = "0.11", default-features = false }
 # zbus/slint, своей копии не добавляет.
 async-channel = "2"
 
+[target.'cfg(target_os = "windows")'.dependencies]
+# Возврат консоли headless-режиму на Windows (main.rs): AttachConsole +
+# CONOUT$ после перевода бинаря на GUI-подсистему (без терминального окна
+# при запуске). 0.61 уже в дереве через cpal/rodio — дубликата не даёт.
+windows-sys = { version = "0.61", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+] }
+
 [target.'cfg(target_os = "windows")'.build-dependencies]
 # Вшивание иконки в exe-ресурс (фаза add-ci-release, build.rs): герб вместо
 # дефолтной иконки rust-бинарника в проводнике и таскбаре. Только для

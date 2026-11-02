@@ -23,6 +23,12 @@
 //! SIGTERM — код 0 в течение секунды. При живом трее закрытие окна
 //! скрывает его, не останавливая воспроизведение.
 
+// GUI-подсистема Windows-бинаря: без атрибута rust собирает консольную
+// подсистему, и рядом с окном плеера открывается терминал (баг win-сборки
+// 0.1.1). В headless-режиме консоль возвращается аттачем к родителю —
+// attach_console_for_headless ниже.
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -366,6 +372,43 @@ fn main() {
 /// Коды выхода: 0 — штатная остановка (сигнал, закрытие окна или конец
 /// потока), 2 — ошибка аргументов, запуска тракта (нет аудиоустройства,
 /// поток не MP3) или сбой живого цикла.
+/// Возврат консоли headless-режиму на Windows: атрибут
+/// `windows_subsystem = "windows"` делает бинарь GUI — терминал при
+/// запуске не открывается, но stderr без консоли невидим. Аттач к
+/// родительскому терминалу и CONOUT$ в стандартные хендлы возвращают
+/// статусы при запуске из терминала; при старте двойным кликом родителя
+/// нет — AttachConsole отказывает, это штатный GUI-режим.
+#[cfg(target_os = "windows")]
+fn attach_console_for_headless() {
+    use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_WRITE, OPEN_EXISTING};
+    use windows_sys::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
+    };
+
+    // "CONOUT$\0" в UTF-16 вручную: w!-макроса у windows-sys нет.
+    let conout_name: [u16; 8] = [67, 79, 78, 79, 85, 84, 36, 0];
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            return;
+        }
+        let conout = CreateFileW(
+            conout_name.as_ptr(),
+            GENERIC_WRITE,
+            FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        );
+        if conout == INVALID_HANDLE_VALUE {
+            return;
+        }
+        SetStdHandle(STD_OUTPUT_HANDLE, conout);
+        SetStdHandle(STD_ERROR_HANDLE, conout);
+    }
+}
+
 fn run() -> i32 {
     let launch = match parse_args(std::env::args_os().skip(1)) {
         Ok(launch) => launch,
@@ -374,6 +417,14 @@ fn run() -> i32 {
             return EXIT_FAILURE;
         }
     };
+
+    // Windows: у GUI-бинаря нет консоли — headless аттачит родительскую,
+    // чтобы статусы в stderr были видны при запуске из терминала. Вызов
+    // до первого say(): стандартные хендлы читаются лениво, при записи.
+    #[cfg(target_os = "windows")]
+    if launch.headless {
+        attach_console_for_headless();
+    }
 
     // Флаг завершения процесса — головной стоп для любой сессии:
     // в headless его ставит сигнал (плюс сторож выхода), в UI — сигнал
