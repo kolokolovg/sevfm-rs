@@ -49,7 +49,7 @@ jobs:
         run: echo "version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "sevfm") | .version')" >> "$GITHUB_OUTPUT"
       - name: Сборка deb
         run: cargo deb --output "sevfm_${{ steps.version.outputs.version }}_amd64.deb"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sevfm-deb
           path: sevfm_*_amd64.deb
@@ -76,7 +76,7 @@ jobs:
         run: cargo build --release
       - name: zip
         run: Compress-Archive -Path target/release/sevfm.exe -DestinationPath "sevfm-${{ steps.version.outputs.version }}-windows-x64.zip"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sevfm-windows-zip
           path: sevfm-*-windows-x64.zip
@@ -108,7 +108,7 @@ jobs:
           [ "$tag" = "$DEB_VERSION" ] || { echo "::error::Тег ссылается на v$tag, а Cargo.toml — $DEB_VERSION (deb). Поднимите версию в Cargo.toml и перетегуйте."; ok=0; }
           [ "$tag" = "$WIN_VERSION" ] || { echo "::error::Тег ссылается на v$tag, а Cargo.toml — $WIN_VERSION (windows). Поднимите версию в Cargo.toml и перетегуйте."; ok=0; }
           [ "$ok" = 1 ]
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
@@ -116,7 +116,7 @@ jobs:
         run: ls -l artifacts
       - name: GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           files: artifacts/*
