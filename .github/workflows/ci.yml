@@ -36,8 +36,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      # ALSA — rodio/cpal (alsa-sys), xkbcommon/fontconfig — winit/femtovg
-      # из дефолтных фич Slint; без них линковка падает.
+      # ALSA — rodio/cpal (alsa-sys), xkbcommon/fontconfig — winit и
+      # software-рендерер Slint (fontique/шрифты); без них линковка падает.
       - name: Системные зависимости
         run: |
           sudo apt-get update

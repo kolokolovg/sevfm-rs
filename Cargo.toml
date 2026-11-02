@@ -1,6 +1,6 @@
 [package]
 name = "sevfm"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Настольный плеер онлайн-радио «Говорит Севастополь»"
 license = "Apache-2.0"
@@ -30,13 +30,22 @@ thiserror = "2"
 # обрезанным — самописный сканер повторял бы баг-поверхность библиотеки.
 # Достаточно Value-доступа к полям, derive-фича serde не нужна.
 serde_json = { version = "1", default-features = false, features = ["std"] }
-# Окно плеера (design D4/D7 add-player-ui): дефолтные фичи — backend-winit
-# + renderer-femtovg (на Linux), accessibility/system-tray осознанно
-# принимаются; software-рендерер остаётся запасным через SLINT_BACKEND.
-# Лицензия GPL-3.0/royalty-free — выбор «Rust + Slint» зафиксирован
-# проектом для личного плеера. Разметка — ui/player-window.slint,
-# компиляция — build.rs; lib от Slint не зависит, только bin.
-slint = "1.18"
+# Окно плеера (design D1 switch-software-renderer): явный набор фич вместо
+# дефолтного — без renderer-femtovg. На Intel/Wayland femtovg не поднимался
+# на аппаратный EGL и тянул софт-стек Mesa (libLLVM+libgallium, ~50 МБ
+# файловых страниц): PSS процесса 92.7 МБ против 32 МБ в покое / 46 МБ при
+# игре у software-рендерера (smaps_rollup, design.md). Окно статичное
+# (render-on-demand), GPU-конвейер избыточен; accessibility/system-tray/compat
+# сохранены. Сцена и поведение те же (ui/player-window.slint, компиляция —
+# build.rs; lib от Slint не зависит).
+slint = { version = "1.18", default-features = false, features = [
+    "std",
+    "backend-winit",
+    "renderer-software",
+    "accessibility",
+    "compat-1-2",
+    "system-tray",
+] }
 # Кодирование поисковой строки сервисов обложек (кириллица в query,
 # design D1 add-album-art): минимальный RFC-3986-энкодер, крейт url
 # с парсером не нужен.
@@ -92,7 +101,7 @@ section = "sound"
 # libasound2t64 (пакет существует только в Ubuntu ≥24.04) и не видит
 # библиотеки, загружаемые winit/x11-dl через dlopen (ldd их не показывает).
 # libasound2 (без t64) выбран как имя, существенное и на Debian (на Ubuntu
-# 24.04 резолвится через Provides). dlopen-часть графического стека (X11/GL)
+# 24.04 резолвится через Provides). dlopen-часть графического стека (X11/Wayland)
 # покрывается типичной графической сессией и в Depends не перечисляется.
 depends = ["libasound2 (>= 1.2)", "libxkbcommon0", "libxkbcommon-x11-0", "libc6", "libfontconfig1"]
 # Краткое описание для apt show: cargo-deb по умолчанию подставляет весь
