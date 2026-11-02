@@ -27,7 +27,7 @@ jobs:
     name: fmt + clippy + тесты (ubuntu)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -61,7 +61,7 @@ jobs:
     name: сборка exe (windows)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       # Общий ключ с windows-job'ом Release: exe собирается не с нуля.
       - uses: Swatinem/rust-cache@v2
