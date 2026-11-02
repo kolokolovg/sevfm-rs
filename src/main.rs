@@ -18,8 +18,10 @@
 //! По умолчанию открывается окно (кнопки «Играть»/«Стоп», станция,
 //! статус, трек); флаг `--headless` сохраняет CLI-поведение: тракт
 //! сразу, статусы и эфир в stderr. Позиционный аргумент — URL потока
-//! (без него — станция по умолчанию). Остановка: «Стоп», закрытие
-//! окна, Ctrl+C (SIGINT) или SIGTERM — код 0 в течение секунды.
+//! (без него — станция по умолчанию). Остановка: «Стоп»; полный выход
+//! — «Выход» из трея, закрытие окна (без трея), Ctrl+C (SIGINT) или
+//! SIGTERM — код 0 в течение секунды. При живом трее закрытие окна
+//! скрывает его, не останавливая воспроизведение.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -30,10 +32,16 @@ use sevfm::cover::{CoverImage, CoverReply, Covers};
 use sevfm::icy::TrackInfo;
 use sevfm::net::{PlaybackStatus, playback_status};
 use sevfm::session::{PlayerSession, SessionHandle, SessionOutcome};
+use sevfm::tray::TraySnapshot;
 use sevfm::ui::{PlayerView, TrackSlot, UiState, parse_args};
 use sevfm::{redact_url, say};
 
 slint::include_modules!();
+
+// MPRIS — только Linux (design D4 add-tray): D-Bus-поток с командами
+// в общий event loop; прочие платформы собираются без него.
+#[cfg(target_os = "linux")]
+mod mpris_service;
 
 /// Интервал опроса сессии (poll-таймер окна и цикл статусов headless) —
 /// тот же ритм, что такт воркера сессии.
@@ -44,6 +52,10 @@ const EXIT_FAILURE: i32 = 2;
 /// Сторожевая граница join воркера после выхода из цикла событий:
 /// закрытие окна и сигнал обязаны давать код 0 ≤ 1 с (спека player-ui).
 const JOIN_DEADLINE: Duration = Duration::from_secs(1);
+/// Ожидание пробы среды трея (находка ревью hunter): у zbus нет
+/// таймаута handshake — «чёрная дыра» в адресе шины не должна вешать
+/// старт UI дольше этого срока.
+const TRAY_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Печать эфира с дедупликацией (design D5 фазы ICY, headless-режим):
 /// станция — один раз при первом появлении, трек — при каждой смене.
@@ -114,6 +126,219 @@ fn slint_cover(image: &CoverImage) -> slint::Image {
 
 /// Разделяемая связка для таймера и обработчиков.
 type SharedUiBinding = Arc<Mutex<UiBinding>>;
+
+/// Команда «Играть» (design D2 add-tray): общий код кнопки окна, меню
+/// трея и MPRIS — все источники зовут одну функцию. Новая сессия —
+/// только из «Остановлено» (гейт can-play отпускает кнопку по факту
+/// завершения воркера, teardown ~100–300 мс: следующая сессия стартует
+/// только на мёртвом воркере — без гонки за аудиоустройство); здесь же
+/// защита от команды, опередившей таймер.
+fn command_play(binding: &SharedUiBinding, window: &PlayerWindow) {
+    // Отравленный замок не глушит команду (находка ревью hunter):
+    // паника под замком уже напечатана хуком, данные связки пригодны
+    // и из отравленного состояния — как в teardown.
+    let mut ui = binding
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if ui
+        .session
+        .as_ref()
+        .is_some_and(|session| session.is_running())
+    {
+        return;
+    }
+    // Мёртвый воркер прошлой сессии: подбираем поток (мгновенно).
+    if let Some(mut old) = ui.session.take() {
+        old.join();
+    }
+    // Заглушка берётся у окна в момент команды: держать Image в
+    // межпоточных замыканиях нельзя (не Send), а окно живёт, пока
+    // жив цикл событий.
+    let placeholder_cover = window.get_placeholder_cover();
+    match PlayerSession::start(ui.url.clone(), ui.process_stop.clone()) {
+        Ok(session) => {
+            say("играть: запуск сессии");
+            ui.session = Some(session);
+            ui.view.reset();
+            // Поля прошлой сессии не имеют отношения к новой:
+            // статус и гейты обновит ближайший poll-такт.
+            window.set_station("".into());
+            window.set_artist("".into());
+            window.set_track_title("".into());
+            window.set_error("".into());
+            // Обложка тоже: гасим незавершённый поиск прошлой
+            // сессии и показываем заглушку до первого трека.
+            ui.covers.invalidate();
+            window.set_cover(placeholder_cover);
+        }
+        Err(e) => {
+            window.set_error(format!("не удалось запустить поток чтения: {e}").into());
+        }
+    }
+}
+
+/// Команда «Стоп» (design D2 add-tray): флаг остановки сессии — воркер
+/// глушит вывод и освобождает устройство за такт опроса, статус уходит
+/// в «Остановлено» по факту завершения воркера (ближайший poll-такт).
+fn command_stop(binding: &SharedUiBinding) {
+    let ui = binding
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(session) = ui.session.as_ref() {
+        say("стоп: остановка сессии");
+        session.stop();
+    }
+}
+
+/// Переключение видимости окна (design D2 add-tray): пункт меню и ЛКМ
+/// по значку; воспроизведение не трогают.
+fn command_toggle_window(window: &PlayerWindow) {
+    if window.window().is_visible() {
+        let _ = window.window().hide();
+    } else {
+        let _ = window.show();
+    }
+}
+
+/// PlayPause MPRIS (design D2): живой поток не паузится — активная
+/// сессия останавливается, остановленная запускается. Только Linux:
+/// единственный источник PlayPause — MPRIS-поток.
+#[cfg(target_os = "linux")]
+fn command_play_pause(binding: &SharedUiBinding, window: &PlayerWindow) {
+    // Отравленный замок не глушит команду (как в command_play/stop).
+    let running = binding
+        .lock()
+        .map(|ui| {
+            ui.session
+                .as_ref()
+                .is_some_and(|session| session.is_running())
+        })
+        .unwrap_or_else(|poisoned| {
+            poisoned
+                .into_inner()
+                .session
+                .as_ref()
+                .is_some_and(|session| session.is_running())
+        });
+    if running {
+        command_stop(binding);
+    } else {
+        command_play(binding, window);
+    }
+}
+
+/// Полный выход (design D5): «Выход» из трея и MPRIS Quit идут тем же
+/// путём, что сигнал, — teardown после цикла событий.
+fn command_quit() {
+    let _ = slint::quit_event_loop();
+}
+
+/// Команды внешних источников в event loop (design D2): кнопки окна,
+/// меню трея и MPRIS исполняют одни хендлеры; вариант нужен только
+/// MPRIS (его поток — не поток цикла событий) — платформа с MPRIS.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum UiCommand {
+    Play,
+    Stop,
+    PlayPause,
+    Raise,
+    Quit,
+}
+
+#[cfg(target_os = "linux")]
+impl UiCommand {
+    /// Исполнение в главном потоке (внутри цикла событий).
+    fn run(self, binding: &SharedUiBinding, window: &PlayerWindow) {
+        match self {
+            UiCommand::Play => command_play(binding, window),
+            UiCommand::Stop => command_stop(binding),
+            UiCommand::PlayPause => command_play_pause(binding, window),
+            UiCommand::Raise => {
+                let _ = window.show();
+            }
+            UiCommand::Quit => command_quit(),
+        }
+    }
+}
+
+/// Планирование команды в цикл событий из любого потока (design D2;
+/// паттерн ctrlc-обработчика). `Weak` и связка — Send, окно живёт,
+/// пока жив цикл. Ошибка доставки (находка ревью) — в лог: молчать о
+/// потерянной команде хуже шума teardown.
+#[cfg(target_os = "linux")]
+fn spawn_ui_command(
+    command: UiCommand,
+    binding: &SharedUiBinding,
+    weak: slint::Weak<PlayerWindow>,
+) {
+    let binding = binding.clone();
+    if let Err(e) = slint::invoke_from_event_loop(move || {
+        if let Some(window) = weak.upgrade() {
+            command.run(&binding, &window);
+        }
+    }) {
+        say(&format!("mpris: команда не доставлена в цикл событий: {e}"));
+    }
+}
+
+/// Проба среды трея (design D3, находки ревью): недостаточно живой
+/// шины — нужен и SNI-хост (`org.kde.StatusNotifierWatcher`), иначе
+/// значок некому показать (GNOME без расширения), а close-to-tray
+/// прячет окно «в никуда» (спека system-tray «Деградация»). Проба —
+/// ранняя диагностика с причиной в логе; ошибки `PlayerTray::new()`
+/// остаются второй линией защиты. Трейд-офф: автозапуск раньше панели
+/// получает отказ на всю сессию — принято (design). Сама проверка идёт
+/// в отдельном потоке с таймаутом: у zbus нет таймаута handshake, и
+/// «чёрная дыра» в адресе шины не должна вешать старт UI — SIGINT её
+/// не прерывает (находка ревью hunter).
+#[cfg(target_os = "linux")]
+fn tray_environment() -> Option<&'static str> {
+    let (probe_tx, probe_rx) = std::sync::mpsc::channel::<Option<&'static str>>();
+    let probe = std::thread::Builder::new()
+        .name("tray-probe".into())
+        .spawn(move || {
+            let result = mpris_server::zbus::block_on(async {
+                let connection = match mpris_server::zbus::Connection::session().await {
+                    Ok(connection) => connection,
+                    Err(_) => return Some("нет шины D-Bus сессии"),
+                };
+                let watcher = connection
+                    .call_method(
+                        Some("org.freedesktop.DBus"),
+                        "/org/freedesktop/DBus",
+                        Some("org.freedesktop.DBus"),
+                        "NameHasOwner",
+                        &"org.kde.StatusNotifierWatcher",
+                    )
+                    .await;
+                let hosted = watcher
+                    .ok()
+                    .and_then(|reply| reply.body().deserialize::<bool>().ok())
+                    .unwrap_or(false);
+                if hosted {
+                    None
+                } else {
+                    Some("нет SNI-хоста (org.kde.StatusNotifierWatcher)")
+                }
+            });
+            let _ = probe_tx.send(result);
+        });
+    let Ok(probe) = probe else {
+        return Some("поток пробы трея не запущен");
+    };
+    // Поток отвязан: зависшая проба приберёт выход процесса.
+    drop(probe);
+    match probe_rx.recv_timeout(TRAY_PROBE_TIMEOUT) {
+        Ok(result) => result,
+        Err(_) => Some("среда трея не ответила вовремя"),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn tray_environment() -> Option<&'static str> {
+    None
+}
 
 fn main() {
     std::process::exit(run());
@@ -260,6 +485,10 @@ fn run_headless(url: &str, process_stop: &Arc<AtomicBool>) -> i32 {
 
 /// Режим окна по умолчанию: окно в «Остановлено», тракт — по «Играть».
 fn run_ui(binding: &SharedUiBinding, process_stop: &Arc<AtomicBool>) -> i32 {
+    // Жив ли трей (design D5): закрывает ли окно «в трей» или завершает
+    // процесс. Взводится созданием tray-компонента; без трея закрытие
+    // окна — полный выход, как прежде.
+    let tray_alive = Arc::new(AtomicBool::new(false));
     let window = match PlayerWindow::new() {
         Ok(window) => window,
         Err(e) => {
@@ -270,70 +499,92 @@ fn run_ui(binding: &SharedUiBinding, process_stop: &Arc<AtomicBool>) -> i32 {
     window.set_status(UiState::Stopped.label().into());
     window.set_can_play(true);
     window.set_can_stop(false);
-    // Заглушка обложки — дефолт свойства окна, прочитан до первого set
-    // (design D7): переиспользуется как значение сброса для не-музыки,
-    // промаха поиска и новой сессии.
-    let placeholder_cover = window.get_cover();
+    // Заглушка обложки — отдельное свойство окна (design D2 add-tray):
+    // Rust читает его и для poll-таймера, и для хендлеров команд.
+    // Старт в «Остановлено» — уже с заглушкой (спека player-ui): у
+    // свойства `cover` дефолта больше нет.
+    let placeholder_cover = window.get_placeholder_cover();
+    window.set_cover(placeholder_cover.clone());
 
-    // «Играть»: новая сессия только из «Остановлено» — гейт can-play
-    // отпускает кнопку по факту завершения воркера (design: teardown
-    // ~100–300 мс, следующая сессия стартует только на мёртвом воркере —
-    // без гонки за аудиоустройство); здесь защита от клика, опередившего
-    // таймер.
+    // Трей (design D1/D3 add-tray): единая иконка приложения, меню —
+    // декларативно в .slint, бэкенд строит Slint. Отказ — только лог:
+    // окно работает, close-to-tray выключен, закрытие окна возвращает
+    // полный выход. Встроенный трей создаётся асинхронно и его отказ
+    // не виден из `new()` (ksni-спавн в цикле событий) — среду (шина +
+    // SNI-хост) пробуем сами, иначе close-to-tray включился бы при
+    // мёртвом/невидимом трее (спека system-tray «Деградация»).
+    let tray = match tray_environment() {
+        None => PlayerTray::new()
+            .inspect_err(|e| say(&format!("трей недоступен: {e}")))
+            .ok(),
+        Some(reason) => {
+            say(&format!("трей недоступен: {reason}"));
+            None
+        }
+    };
+    if tray.is_some() {
+        tray_alive.store(true, Ordering::SeqCst);
+    }
+    if let Some(tray) = tray.as_ref() {
+        // Команды меню — общие хендлеры (design D2); «Выход» — тот же
+        // путь, что сигнал.
+        {
+            let binding = binding.clone();
+            let weak = window.as_weak();
+            tray.on_play(move || {
+                if let Some(window) = weak.upgrade() {
+                    command_play(&binding, &window);
+                }
+            });
+        }
+        {
+            let binding = binding.clone();
+            tray.on_stop(move || command_stop(&binding));
+        }
+        {
+            let weak = window.as_weak();
+            tray.on_toggle_window(move || {
+                if let Some(window) = weak.upgrade() {
+                    command_toggle_window(&window);
+                }
+            });
+        }
+        tray.on_quit(command_quit);
+    }
+
+    // MPRIS (design D4 add-tray): сервис в отдельном потоке, команды —
+    // в общий event loop; отказ шины — только лог, трей не нужен.
+    #[cfg(target_os = "linux")]
+    let mpris = {
+        use mpris_service::{Mpris, MprisCommand};
+        let binding = binding.clone();
+        let weak = window.as_weak();
+        Mpris::start(Arc::new(move |command| {
+            let command = match command {
+                MprisCommand::Play => UiCommand::Play,
+                MprisCommand::Stop => UiCommand::Stop,
+                MprisCommand::PlayPause => UiCommand::PlayPause,
+                MprisCommand::Raise => UiCommand::Raise,
+                MprisCommand::Quit => UiCommand::Quit,
+            };
+            spawn_ui_command(command, &binding, weak.clone());
+        }))
+    };
+
+    // «Играть» и «Стоп» — общие хендлеры команд (design D2 add-tray):
+    // тот же код зовут меню трея и MPRIS; кнопки лишь доставляют
+    // команду в главный поток, где живёт цикл событий.
     {
         let binding = binding.clone();
         let weak = window.as_weak();
-        let placeholder_cover = placeholder_cover.clone();
         window.on_play(move || {
             let Some(window) = weak.upgrade() else { return };
-            let Ok(mut ui) = binding.lock() else { return };
-            if ui
-                .session
-                .as_ref()
-                .is_some_and(|session| session.is_running())
-            {
-                return;
-            }
-            // Мёртвый воркер прошлой сессии: подбираем поток (мгновенно).
-            if let Some(mut old) = ui.session.take() {
-                old.join();
-            }
-            match PlayerSession::start(ui.url.clone(), ui.process_stop.clone()) {
-                Ok(session) => {
-                    say("играть: запуск сессии");
-                    ui.session = Some(session);
-                    ui.view.reset();
-                    // Поля прошлой сессии не имеют отношения к новой:
-                    // статус и гейты обновит ближайший poll-такт.
-                    window.set_station("".into());
-                    window.set_artist("".into());
-                    window.set_track_title("".into());
-                    window.set_error("".into());
-                    // Обложка тоже: гасим незавершённый поиск прошлой
-                    // сессии и показываем заглушку до первого трека.
-                    ui.covers.invalidate();
-                    window.set_cover(placeholder_cover.clone());
-                }
-                Err(e) => {
-                    window.set_error(format!("не удалось запустить поток чтения: {e}").into());
-                }
-            }
+            command_play(&binding, &window);
         });
     }
-
-    // «Стоп»: флаг остановки сессии — воркер глушит вывод и освобождает
-    // устройство за такт опроса, статус уходит в «Остановлено» по факту
-    // завершения воркера (ближайший poll-такт).
     {
         let binding = binding.clone();
-        window.on_stop(move || {
-            if let Ok(ui) = binding.lock()
-                && let Some(session) = ui.session.as_ref()
-            {
-                say("стоп: остановка сессии");
-                session.stop();
-            }
-        });
+        window.on_stop(move || command_stop(&binding));
     }
 
     // Poll-таймер (design D3): создаётся в главном потоке (ограничение
@@ -345,6 +596,9 @@ fn run_ui(binding: &SharedUiBinding, process_stop: &Arc<AtomicBool>) -> i32 {
         let binding = binding.clone();
         let weak = window.as_weak();
         let process_stop = process_stop.clone();
+        // Хендл трея для poll-такта: Timer живёт на потоке Slint, VRc
+        // переносить между потоками не нужно.
+        let tray = tray.as_ref().map(|tray| tray.clone_strong());
         timer.start(slint::TimerMode::Repeated, POLL_INTERVAL, move || {
             // Сигнал до старта цикла терял quit_event_loop (Slint не
             // латчит запрос без цикла — NoEventLoopProvider): повторяем
@@ -354,10 +608,39 @@ fn run_ui(binding: &SharedUiBinding, process_stop: &Arc<AtomicBool>) -> i32 {
             }
             let Some(window) = weak.upgrade() else { return };
             let Ok(mut ui) = binding.lock() else { return };
-            let Some(session) = ui.session.as_ref() else {
-                return;
-            };
-            let tick = session.tick();
+            let tick = ui.session.as_ref().map(|session| session.tick());
+            // Снапшот внешних поверхностей — один на такт (design D2):
+            // трей обновляет свойства, MPRIS шлёт статус и метаданные;
+            // дедупликацию делают сами потребители (ChangeTracker у
+            // свойств, Player у PlaybackStatus/Metadata).
+            let snapshot = TraySnapshot::from_tick(tick.as_ref(), window.window().is_visible());
+            if let Some(tray) = tray.as_ref() {
+                tray.set_tray_tooltip(snapshot.tooltip().into());
+                tray.set_can_play(snapshot.can_play());
+                tray.set_can_stop(snapshot.can_stop());
+                tray.set_window_visible(snapshot.window_visible);
+            }
+            #[cfg(target_os = "linux")]
+            if let Some(mpris) = mpris.as_ref() {
+                // artUrl — только у музыкального трека с обложкой
+                // в кеше (спека mpris); имя файла — sha256, но базовый
+                // каталог из XDG/HOME требует экранирования (находка
+                // аудита — sevfm::mpris::file_uri).
+                let art_url = match &snapshot.track {
+                    TrackSlot::Track { artist, title } => {
+                        sevfm::cover::cached_cover_path(artist, title)
+                            .map(|path| sevfm::mpris::file_uri(&path))
+                    }
+                    _ => None,
+                };
+                mpris.push(mpris_service::MprisUpdate {
+                    playback: sevfm::mpris::MprisPlayback::of(&snapshot),
+                    track: sevfm::mpris::MprisTrack::of(&snapshot),
+                    art_url,
+                    stream_url: ui.url.clone(),
+                });
+            }
+            let Some(tick) = tick else { return };
             let update = ui.view.poll(&tick);
             if let Some(station) = update.station {
                 window.set_station(station.unwrap_or_default().into());
@@ -436,7 +719,35 @@ fn run_ui(binding: &SharedUiBinding, process_stop: &Arc<AtomicBool>) -> i32 {
         });
     }
 
-    let event_loop = window.run();
+    // Close-to-tray (design D5): закрытие окна при живом трее лишь
+    // скрывает окно — процесс и воспроизведение живут, полный выход
+    // идёт через quit_event_loop («Выход» из трея, сигнал, MPRIS Quit)
+    // и разбирается одинаковым teardown ниже. Хендлер обязателен и без
+    // трея: под until_quit закрытие по умолчанию не завершает цикл.
+    {
+        let tray_alive = tray_alive.clone();
+        window.window().on_close_requested(move || {
+            say(&format!(
+                "закрытие окна: трей жив = {}",
+                tray_alive.load(Ordering::SeqCst)
+            ));
+            if !tray_alive.load(Ordering::SeqCst) {
+                let _ = slint::quit_event_loop();
+            }
+            slint::CloseRequestResponse::HideWindow
+        });
+    }
+
+    // Цикл — до явного quit_event_loop (design D5): скрытие последнего
+    // окна (в том числе в close-to-tray) цикл не завершает — семантика
+    // run_event_loop_until_quit (slint: set_event_loop_quit_on_last_
+    // window_closed(false)). Показ окна явный: until_quit не делает
+    // этого за нас, в отличие от window.run().
+    if let Err(e) = window.show() {
+        say(&format!("не удалось показать окно: {e}"));
+        return EXIT_FAILURE;
+    }
+    let event_loop = slint::run_event_loop_until_quit();
     drop(timer);
 
     // Разбор после цикла событий (закрытие окна или сигнал): остановка

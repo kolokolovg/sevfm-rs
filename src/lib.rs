@@ -19,9 +19,11 @@
 pub mod buffer;
 pub mod cover;
 pub mod icy;
+pub mod mpris;
 pub mod net;
 pub mod pipeline;
 pub mod session;
+pub mod tray;
 pub mod ui;
 
 /// Пользовательское сообщение в stderr: по-русски, с префиксом `sevfm: `
@@ -42,11 +44,13 @@ pub fn say(message: &str) {
 }
 
 /// Управляющие байты (кроме табуляции) и невидимые bidi/формат-символы
-/// Unicode заменяются на U+FFFD: ESC-последовательности из скопированного
+/// Unicode заменяются на U+FFFD: ESC-последовательции из скопированного
 /// URL не перерисовывают терминал, CRLF не подделывает строки лога, а
 /// bidi-символы (U+202A–202E, U+2066–2069, U+200B–200F, U+FEFF — это Cf,
-/// не Cc, `is_control()` их не ловит) не спуфят отображение названия трека.
-fn sanitize_for_terminal(text: &str) -> std::borrow::Cow<'_, str> {
+/// не Cc, `is_control()` их не ловят) не спуфят отображение названия трека.
+/// Публично с фазы add-tray: недоверенные строки эфира уходят не только
+/// в лог, но и в тултип трея и метаданные MPRIS (находка аудита).
+pub fn sanitize_display(text: &str) -> std::borrow::Cow<'_, str> {
     let spoofing = |c: char| matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200B}'..='\u{200F}' | '\u{FEFF}');
     if text
         .chars()
@@ -65,6 +69,11 @@ fn sanitize_for_terminal(text: &str) -> std::borrow::Cow<'_, str> {
             })
             .collect(),
     )
+}
+
+/// Сообщения для пользователя — та же очистка, что и для GUI-строк.
+fn sanitize_for_terminal(text: &str) -> std::borrow::Cow<'_, str> {
+    sanitize_display(text)
 }
 
 /// URL для вывода в терминал: userinfo (`scheme://user:pass@…`) вырезается —

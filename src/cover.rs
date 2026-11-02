@@ -276,6 +276,15 @@ fn cache_key(artist: &str, title: &str) -> String {
     format!("{digest:x}")
 }
 
+/// Путь файла кеша обложки трека, если файл существует (design D4
+/// add-tray: `mpris:artUrl` — file:// на файл кеша). Кеш отключён или
+/// обложки ещё нет — None; имя файла — sha256-ключ, путь безопасен
+/// для URI без экранирования.
+pub fn cached_cover_path(artist: &str, title: &str) -> Option<std::path::PathBuf> {
+    let file = cache_dir()?.join(cache_key(artist, title) + ".jpg");
+    file.is_file().then_some(file)
+}
+
 /// Обложка из кеша; повреждённый файл удаляется и считается промахом
 /// (design D4) — при следующей смене трек поищется заново.
 fn read_cached(dir: &Path, artist: &str, title: &str) -> Option<CoverImage> {

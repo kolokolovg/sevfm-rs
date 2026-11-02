@@ -55,6 +55,19 @@ image = { version = "0.25", default-features = false, features = ["jpeg"] }
 # Компиляция .slint-разметки окна в build-скрипте (версия в sync с slint).
 slint-build = "1.18"
 
+# MPRIS-сервис на D-Bus (design D4 add-tray): интеграция плеера в
+# KDE-аплет. Крейт async-only, но zbus 6 обслуживает соединение своим
+# helper-потоком — встраивание без tokio: выделенный std::thread с
+# mpris_server::zbus::block_on. Linux-only. Второй мажор zbus в дереве
+# (5 — через ksni/slint) принят осознанно (design, риски). Дефолтные
+# фичи выключены: tokio-интеграция не нужна.
+[target.'cfg(target_os = "linux")'.dependencies]
+mpris-server = { version = "0.11", default-features = false }
+# Канал обновлений MPRIS-потока (design D4 add-tray): async-канал с
+# waker'ом — селект с обработкой D-Bus-вызовов; уже в дереве через
+# zbus/slint, своей копии не добавляет.
+async-channel = "2"
+
 [dev-dependencies]
 # Property-based-тесты парсера ICY-метаблоков: скилл rust-clean-code
 # прямо называет ICY-метаблоки целью PBT фазы 2 (инвариант кадрировщика,

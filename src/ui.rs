@@ -182,8 +182,9 @@ impl PlayerView {
 
 /// Содержимое трек-строки по снимку: мёртвая сессия, отсутствие трека
 /// и рекламная вставка дают заглушку с названием станции (смена станции
-/// обновляет и заглушку — сравнение слота по значению).
-fn track_slot(tick: &SessionTick) -> TrackSlot {
+/// обновляет и заглушку — сравнение слота по значению). Публично для
+/// тултипа трея (design D2 add-tray): одна трек-строка для окна и трея.
+pub fn track_slot(tick: &SessionTick) -> TrackSlot {
     match (&tick.track, tick.alive) {
         (Some(TrackInfo::Track { artist, title }), true) => TrackSlot::Track {
             artist: artist.clone(),

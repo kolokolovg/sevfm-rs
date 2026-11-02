@@ -16,9 +16,14 @@ export component PlayerWindow inherits Window {
     // (заголовок), переопределить его нельзя.
     in-out property <string> track-title;
     in-out property <string> error;
-    // Обложка текущего трека; дефолт — заглушка, Rust-сторона читает
-    // его один раз (get_cover до первого set) как значение сброса.
-    in-out property <image> cover: @image-url("cover-placeholder.png");
+    // Обложка текущего трека. Дефолта нет: значение сброса — заглушка
+    // из `placeholder-cover`, Rust читает её у окна по мере надобности
+    // (в том числе из хендлеров команд трея/MPRIS — держать Image в
+    // межпоточных замыканиях нельзя, он не Send).
+    in-out property <image> cover;
+    // Заглушка обложки: не-музыка (вставка, сырой StreamTitle), промах
+    // поиска и сброс на новой сессии.
+    in-out property <image> placeholder-cover: @image-url("cover-placeholder.png");
     // Гейты кнопок из UiState: «Играть» — только из «Остановлено».
     in-out property <bool> can-play: true;
     in-out property <bool> can-stop: false;
@@ -27,6 +32,9 @@ export component PlayerWindow inherits Window {
     callback stop();
 
     title: "Говорит Севастополь";
+    // Иконка окна (заголовок/таскбар) — единая иконка приложения
+    // (герб Севастополя, design D6 add-tray).
+    icon: @image-url("app-icon.png");
     preferred-width: 440px;
     preferred-height: 560px;
     background: #14161d;
@@ -112,6 +120,56 @@ export component PlayerWindow inherits Window {
                 enabled: root.can-stop;
                 clicked => { root.stop(); }
             }
+        }
+    }
+}
+
+// Трей (design D1 add-tray): встроенный SystemTrayIcon — значок и меню
+// заявляются декларативно, Slint сам строит платформенный бэкенд (ksni
+// на Linux, Shell_NotifyIconW на Windows) и перестраивает меню при
+// смене свойств. Rust-сторона (main.rs) создаёт компонент, толкает
+// свойства из poll-такта и подписывается на колбэки. Tooltip и icon —
+// унаследованные свойства SystemTrayIcon, здесь задан стартовый текст.
+export component PlayerTray inherits SystemTrayIcon {
+    icon: @image-url("app-icon.png");
+    // Тултип нативного айтема наружу не экспортируется — обновляется
+    // через алиас-свойство из poll-такта.
+    in-out property <string> tray-tooltip: "Говорит Севастополь — Остановлено";
+    tooltip: root.tray-tooltip;
+
+    // Состояние из poll-такта: гейты пунктов и label переключателя окна.
+    in-out property <bool> can-play: true;
+    in-out property <bool> can-stop: false;
+    in-out property <bool> window-visible: true;
+
+    // Команды — те же хендлеры, что у кнопок окна (design D2);
+    // левый клик по значку (нативный clicked) — тоже переключатель.
+    callback play();
+    callback stop();
+    callback toggle-window();
+    callback quit();
+    clicked => { root.toggle-window(); }
+
+    Menu {
+        MenuItem {
+            title: "Играть";
+            enabled: root.can-play;
+            activated => { root.play(); }
+        }
+        MenuItem {
+            title: "Стоп";
+            enabled: root.can-stop;
+            activated => { root.stop(); }
+        }
+        MenuSeparator {}
+        MenuItem {
+            title: root.window-visible ? "Скрыть окно" : "Показать окно";
+            activated => { root.toggle-window(); }
+        }
+        MenuSeparator {}
+        MenuItem {
+            title: "Выход";
+            activated => { root.quit(); }
         }
     }
 }
