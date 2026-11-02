@@ -58,6 +58,11 @@ jobs:
   windows:
     name: exe в zip (windows)
     runs-on: windows-latest
+    # Экшен SignPath читает детали job'а и скачивает артефакт через
+    # github-token: нужен доступ к API Actions (contents: read дан сверху).
+    permissions:
+      actions: read
+      contents: read
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -74,8 +79,42 @@ jobs:
           Add-Content $env:GITHUB_OUTPUT "version=$v"
       - name: Release-сборка
         run: cargo build --release
+      # Подпись кода (SignPath Foundation, OV-сертификат для опенсорса):
+      # заявка подаётся на signpath.org, после одобрения в секреты репо
+      # кладутся SIGNPATH_API_TOKEN и SIGNPATH_ORGANIZATION_ID — шаги ниже
+      # включаются сами. Слаги проекта и политики приходят письмом
+      # онбординга; до подписи или при расхождении — править здесь.
+      - name: Подпись настроена?
+        env:
+          SIGNING_CONFIGURED: ${{ secrets.SIGNPATH_API_TOKEN != '' }}
+        run: Add-Content $env:GITHUB_ENV "SIGNING_CONFIGURED=$env:SIGNING_CONFIGURED"
+      - name: exe на подпись
+        id: unsigned
+        if: env.SIGNING_CONFIGURED == 'true'
+        # Артефакт — транспорт для SignPath (экшен подписывает то, что
+        # скачал по artifact-id); сутки хранения достаточно.
+        uses: actions/upload-artifact@v7
+        with:
+          name: sevfm-exe-unsigned
+          path: target/release/sevfm.exe
+          retention-days: 1
+      - name: Подпись SignPath
+        if: env.SIGNING_CONFIGURED == 'true'
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: sevfm-rs
+          signing-policy-slug: release-signing
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed
       - name: zip
-        run: Compress-Archive -Path target/release/sevfm.exe -DestinationPath "sevfm-${{ steps.version.outputs.version }}-windows-x64.zip"
+        # Подписанный exe заменяет исходный; неподписанные релизы (заявка
+        # ещё не одобрена) пакуются как раньше.
+        run: |
+          $exe = if ($env:SIGNING_CONFIGURED -eq 'true') { 'signed/sevfm.exe' } else { 'target/release/sevfm.exe' }
+          Compress-Archive -Path $exe -DestinationPath "sevfm-${{ steps.version.outputs.version }}-windows-x64.zip"
       - uses: actions/upload-artifact@v7
         with:
           name: sevfm-windows-zip

@@ -18,9 +18,10 @@
 fn main() {
     slint_build::compile("ui/player-window.slint").expect("разметка окна компилируется");
 
-    // Иконка exe-файла (фаза add-ci-release): Windows-ресурс из packaging/
-    // sevfm.ico — проводник и таскбар показывают герб, а не дефолтную иконку
-    // rust-бинарника. На Linux ветка не компилируется: иконки окна и трея
+    // Иконка exe-файла (фаза add-ci-release) и его версионная информация:
+    // Windows-ресурс из packaging/sevfm.ico — проводник и таскбар показывают
+    // герб, а не дефолтную иконку rust-бинарника. На Linux ветка не компилируется:
+    // иконки окна и трея
     // уже вшиты в бинарник Slint-компилятором из ui/app-icon.png, а
     // «иконку пакета» видит файловая система — её кладёт cargo-deb (desktop +
     // hicolor, Cargo.toml [package.metadata.deb]).
@@ -28,6 +29,24 @@ fn main() {
     {
         let mut resource = winresource::WindowsResource::new();
         resource.set_icon("packaging/sevfm.ico");
-        resource.compile().expect("иконка exe вшивается ресурсом");
+        // Версионная информация: проводник показывает описание и версию в
+        // свойствах exe, а эвристики защитника лояльнее к файлам с заполненным
+        // ресурсом, чем к «голому» бинарю. Числовые FILEVERSION и
+        // PRODUCTVERSION winresource берёт из версии пакета сам; строки — из
+        // переменных окружения cargo, чтобы версия жила в одном месте —
+        // Cargo.toml.
+        resource.set("ProductName", "sevfm");
+        resource.set("FileDescription", env!("CARGO_PKG_DESCRIPTION"));
+        resource.set("FileVersion", env!("CARGO_PKG_VERSION"));
+        resource.set("ProductVersion", env!("CARGO_PKG_VERSION"));
+        resource.set("CompanyName", env!("CARGO_PKG_AUTHORS"));
+        resource.set(
+            "LegalCopyright",
+            "Copyright 2026 Gleb Kolokolov, Apache-2.0",
+        );
+        resource.set("OriginalFilename", "sevfm.exe");
+        resource
+            .compile()
+            .expect("иконка и версия вшиваются ресурсом");
     }
 }

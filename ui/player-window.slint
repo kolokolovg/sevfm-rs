@@ -309,7 +309,13 @@ export component PlayerWindow inherits Window {
 // свойства из poll-такта и подписывается на колбэки. Tooltip и icon —
 // унаследованные свойства SystemTrayIcon, здесь задан стартовый текст.
 export component PlayerTray inherits SystemTrayIcon {
-    icon: @image-url("app-icon.png");
+    // Отдельная маленькая иконка, не app-icon.png (256×256): ksni-бэкенд
+    // Slint сериализует пиксели иконки трея в D-Bus, оборачивая каждый байт
+    // в отдельный zvariant Value — 256×256 раздувается в два блока по 16 МБ
+    // (замер gdb/addr2line живого процесса 0.1.2: Vec<Value>::from_iter по
+    // ksni::tray::Icon). 48×48 достаточно для отрисовки в трее (~22 px) и
+    // сокращает эти блоки до ~0.5 МБ; окно по-прежнему на полной иконке.
+    icon: @image-url("tray-icon.png");
     // Тултип нативного айтема наружу не экспортируется — обновляется
     // через алиас-свойство из poll-такта.
     in-out property <string> tray-tooltip: "Говорит Севастополь — Остановлено";
