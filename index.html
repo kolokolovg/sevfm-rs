@@ -46,15 +46,15 @@
         <li>Rust · edition 2024</li>
         <li>Apache-2.0</li>
         <li>Linux · Windows</li>
-        <li class="pill-link"><a href="https://github.com/kolokolovg/sevfm-rs/releases">v0.1.2 · релизы</a></li>
+        <li class="pill-link"><a href="https://github.com/kolokolovg/sevfm-rs/releases">v0.1.3 · релизы</a></li>
       </ul>
       <p class="hero-note">Нативный бинарник с малым потреблением памяти:
-        ~32&nbsp;МБ в покое и ~46&nbsp;МБ при воспроизведении (замер PSS).
+        ~23&nbsp;МБ в покое и ~34&nbsp;МБ при воспроизведении (замер PSS).
         Живой MP3-стрим, устойчивый к обрывам сети, метаданные эфира синхронно
         со звуком, трей и MPRIS.</p>
       <div class="cta-row">
         <a class="btn btn-primary" href="https://github.com/kolokolovg/sevfm-rs/releases/latest">
-          Скачать v0.1.2</a>
+          Скачать v0.1.3</a>
         <a class="btn btn-ghost" href="https://github.com/kolokolovg/sevfm-rs">
           Исходники на GitHub</a>
       </div>
@@ -64,7 +64,7 @@
     <figure class="window-wrap">
       <img class="window-shot" src="assets/player-window.png" width="691" height="876"
            alt="Окно плеера sevfm в живом эфире: крупная обложка текущего трека, зелёный индикатор «Воспроизведение», станция «Говорит Севастополь», исполнитель и название композиции, кнопки «Играть» и «Стоп»">
-      <figcaption>Настоящее окно плеера (v0.1.2): живой эфир — обложка
+      <figcaption>Настоящее окно плеера : живой эфир — обложка
         подтянута цепочкой iTunes&nbsp;→ Deezer → Яндекс.Музыка</figcaption>
     </figure>
   </div>
@@ -115,7 +115,7 @@
         <p>Нативный бинарник на Rust с UI на Slint (render-on-demand):
           интерфейс перерисовывается только по изменению состояния, окно
           рисует программный рендерер — графический стек не нужен.
-          ~32&nbsp;МБ памяти в покое и ~46&nbsp;МБ при воспроизведении (PSS).</p>
+          ~23&nbsp;МБ памяти в покое и ~34&nbsp;МБ при воспроизведении (PSS).</p>
       </article>
       <article class="card">
         <h3>Headless-режим</h3>
@@ -206,7 +206,7 @@
         <div><h3>CI и автоматические релизы</h3>
           <p>Формат, линты и тесты на каждый пуш; релизы тегом <code>v*</code>:
             deb для Linux и exe в zip для Windows —
-            <a href="https://github.com/kolokolovg/sevfm-rs/releases">v0.1.0–v0.1.2</a>.</p></div>
+            <a href="https://github.com/kolokolovg/sevfm-rs/releases">v0.1.0–v0.1.3</a>.</p></div>
       </li>
     </ul>
     <p class="section-lead">Поведение зафиксировано спецификациями в
@@ -220,9 +220,9 @@
     <h2>Установка и сборка</h2>
     <p class="section-lead">Готовые пакеты — на
       <a href="https://github.com/kolokolovg/sevfm-rs/releases">странице релизов</a>:
-      <code>sevfm_0.1.2_amd64.deb</code> для Linux (собран на Ubuntu&nbsp;24.04,
+      <code>sevfm_0.1.3_amd64.deb</code> для Linux (собран на Ubuntu&nbsp;24.04,
       нужен glibc&nbsp;≥&nbsp;2.39; ярлык и герб появляются в меню приложений)
-      и <code>sevfm-0.1.2-windows-x64.zip</code> с <code>sevfm.exe</code>
+      и <code>sevfm-0.1.3-windows-x64.zip</code> с <code>sevfm.exe</code>
       для Windows. Релизы выпускаются автоматически тегом <code>v*</code>.</p>
     <p class="section-lead">Или соберите из исходников:</p>
     <div class="build-grid">
@@ -274,7 +274,7 @@ cargo test --test sigint_live -- --ignored</code></pre>
 
 <footer class="site-footer">
   <div class="container footer-row">
-    <p><span class="brand-note" aria-hidden="true">♪</span> sevfm v0.1.2 ·
+    <p><span class="brand-note" aria-hidden="true">♪</span> sevfm v0.1.3 ·
       порт <abbr title="оригинальная версия плеера на Java">Java-версии</abbr> ·
       автор — Gleb Kolokolov</p>
     <p class="footer-links">
