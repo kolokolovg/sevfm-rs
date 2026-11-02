@@ -1,5 +1,7 @@
 # sevfm (sevfm-rs)
 
+[![CI](https://github.com/kolokolovg/sevfm-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/kolokolovg/sevfm-rs/actions/workflows/ci.yml)
+
 Настольный плеер онлайн-радио **«Говорит Севастополь»** на Rust + Slint.
 
 Цель: нативный бинарник с малым потреблением ОЗУ и процессора
@@ -23,9 +25,39 @@
 
 ## Сборка
 
+Linux — сначала системные библиотеки (ALSA — вывод звука через
+rodio/cpal; xkbcommon и fontconfig — окно Slint/winit):
+
 ```bash
+sudo apt install libasound2-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev
 cargo build --release
 ```
+
+Windows — `cargo build --release`; иконка exe вшивается ресурсом из
+`packaging/sevfm.ico` (winresource в build-скрипте).
+
+### Пакеты
+
+deb — бинарник + `.desktop` и иконка hicolor (приложение «SevFM»
+появляется в меню с гербом):
+
+```bash
+cargo install cargo-deb
+cargo deb          # → target/debian/sevfm_<версия>_amd64.deb
+```
+
+Релизный deb собирается CI на Ubuntu 24.04 — требуется glibc ≥ 2.39
+(Debian 13+/Ubuntu 24.04+; на более старых — собирайте локально).
+
+### CI и релизы
+
+- Каждый пуш/PR — [CI](.github/workflows/ci.yml): форматирование, clippy,
+  офлайн-тесты (ubuntu) + release-сборка exe (windows).
+- Пуш тега `v*` — [Release](.github/workflows/release.yml): `sevfm.exe`
+  в zip и deb прикрепляются к GitHub Release. Имена файлов — из версии
+  `Cargo.toml`: расхождение с тегом останавливает публикацию. Ручная
+  тестовая сборка — Run workflow в Actions (без публикации; с галочкой
+  `publish` и запуском на теге — публикует).
 
 ## Запуск (фаза 1)
 

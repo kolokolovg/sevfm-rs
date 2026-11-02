@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=SevFM
+Comment=Плеер онлайн-радио «Говорит Севастополь»
+Exec=sevfm
+Icon=sevfm
+Terminal=false
+Categories=Audio;AudioVideo;Player;
+Keywords=радио;плеер;Севастополь;radio;sevfm;

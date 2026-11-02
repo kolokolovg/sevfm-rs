@@ -1,0 +1,60 @@
+# CI (фаза add-ci-release): проверка каждого пуша/PR.
+# Linux — полный набор ворот: формат, линты, офлайн-тесты (живые тесты
+# помечены #[ignore] и не запускаются). Windows — только сборка: exe не
+# должен разваливаться между релизами, полный набор тестов оставлен Linux
+# (сигнальные тесты #[cfg(unix)], аудио-устройства в CI нет).
+name: CI
+
+# Теги v* не дублируют CI: их обслуживает Release на том же коммите.
+on:
+  push:
+    tags-ignore: ['v*']
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: fmt + clippy + тесты (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      # cache-on-failure: красный прогон тоже греет кеш — быстрые итерации
+      # починки, а не холодная пересборка Slint на каждый фикс.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      # ALSA — rodio/cpal (alsa-sys), xkbcommon/fontconfig — winit/femtovg
+      # из дефолтных фич Slint; без них линковка падает.
+      - name: Системные зависимости
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev
+      - name: Форматирование
+        run: cargo fmt --all --check
+      - name: Линты
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Офлайн-тесты
+        run: cargo test
+
+  windows:
+    name: сборка exe (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Общий ключ с windows-job'ом Release: exe собирается не с нуля.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-release
+      - name: Release-сборка
+        run: cargo build --release

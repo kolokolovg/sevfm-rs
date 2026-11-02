@@ -1,0 +1,123 @@
+# Релиз (фаза add-ci-release): Windows exe (zip) + Linux deb.
+# Автопубликация — пушем тега v*; ручной запуск из Actions собирает те же
+# артефакты, а с галочкой publish публикует их как GitHub Release (запускать
+# на теге — номер релиза берётся из тега). Версии файлов — из Cargo.toml,
+# расхождение с тегом останавливает публикацию с явной ошибкой.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Опубликовать GitHub Release (запускать на теге v*)'
+        type: boolean
+        default: false
+
+# Право записи нужно только публикации; сборочным job'ам достаточно чтения.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  deb:
+    name: deb-пакет (ubuntu)
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Те же зависимости, что и в CI: сборка deb — это cargo build --release
+      # плюс упаковка, линковка требует ALSA и xkbcommon/fontconfig.
+      - name: Системные зависимости
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev
+      - name: cargo-deb
+        # Мажор запинен: поведение флагов/ассетов должно оставаться тем,
+        # что валидировано на этой конфигурации (локально — 3.8.0).
+        run: cargo install cargo-deb --locked --version 3
+      - name: Версия из Cargo.toml
+        id: version
+        run: echo "version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "sevfm") | .version')" >> "$GITHUB_OUTPUT"
+      - name: Сборка deb
+        run: cargo deb --output "sevfm_${{ steps.version.outputs.version }}_amd64.deb"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sevfm-deb
+          path: sevfm_*_amd64.deb
+          if-no-files-found: error
+
+  windows:
+    name: exe в zip (windows)
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Общий ключ с windows-job'ом CI: релизы не собирают Slint с нуля.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-release
+      - name: Версия из Cargo.toml
+        id: version
+        run: |
+          $v = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages | Where-Object { $_.name -eq 'sevfm' } | Select-Object -ExpandProperty version
+          Add-Content $env:GITHUB_OUTPUT "version=$v"
+      - name: Release-сборка
+        run: cargo build --release
+      - name: zip
+        run: Compress-Archive -Path target/release/sevfm.exe -DestinationPath "sevfm-${{ steps.version.outputs.version }}-windows-x64.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sevfm-windows-zip
+          path: sevfm-*-windows-x64.zip
+          if-no-files-found: error
+
+  release:
+    name: публикация
+    needs: [deb, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    if: github.event_name == 'push' || inputs.publish == true
+    steps:
+      # Ручной запуск с publish на ветке (не на теге) — явная ошибка вместо
+      # тихого пропуска, чтобы не гадать, почему релиза нет.
+      - name: Публикация только с тега v*
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        run: |
+          echo "::error::Release публикуется только с тега v*: перезапустите workflow на теге (Run workflow → выбор тега) или снимите галочку publish — сборки останутся в артефактах запуска."
+          exit 1
+      - name: Тег совпадает с версией Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          DEB_VERSION: ${{ needs.deb.outputs.version }}
+          WIN_VERSION: ${{ needs.windows.outputs.version }}
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ok=1
+          [ "$tag" = "$DEB_VERSION" ] || { echo "::error::Тег ссылается на v$tag, а Cargo.toml — $DEB_VERSION (deb). Поднимите версию в Cargo.toml и перетегуйте."; ok=0; }
+          [ "$tag" = "$WIN_VERSION" ] || { echo "::error::Тег ссылается на v$tag, а Cargo.toml — $WIN_VERSION (windows). Поднимите версию в Cargo.toml и перетегуйте."; ok=0; }
+          [ "$ok" = 1 ]
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Файлы релиза
+        run: ls -l artifacts
+      - name: GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: artifacts/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

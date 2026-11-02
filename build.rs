@@ -17,4 +17,17 @@
 
 fn main() {
     slint_build::compile("ui/player-window.slint").expect("разметка окна компилируется");
+
+    // Иконка exe-файла (фаза add-ci-release): Windows-ресурс из packaging/
+    // sevfm.ico — проводник и таскбар показывают герб, а не дефолтную иконку
+    // rust-бинарника. На Linux ветка не компилируется: иконки окна и трея
+    // уже вшиты в бинарник Slint-компилятором из ui/app-icon.png, а
+    // «иконку пакета» видит файловая система — её кладёт cargo-deb (desktop +
+    // hicolor, Cargo.toml [package.metadata.deb]).
+    #[cfg(target_os = "windows")]
+    {
+        let mut resource = winresource::WindowsResource::new();
+        resource.set_icon("packaging/sevfm.ico");
+        resource.compile().expect("иконка exe вшивается ресурсом");
+    }
 }

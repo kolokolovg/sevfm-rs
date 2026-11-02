@@ -68,8 +68,42 @@ mpris-server = { version = "0.11", default-features = false }
 # zbus/slint, своей копии не добавляет.
 async-channel = "2"
 
+[target.'cfg(target_os = "windows")'.build-dependencies]
+# Вшивание иконки в exe-ресурс (фаза add-ci-release, build.rs): герб вместо
+# дефолтной иконки rust-бинарника в проводнике и таскбаре. Только для
+# Windows-таргета — Linux-сборка пакет не тянет; иконки окна и трея на Linux
+# уже вшиты в бинарник Slint-компилятором из ui/app-icon.png.
+winresource = "0.1"
+
 [dev-dependencies]
 # Property-based-тесты парсера ICY-метаблоков: скилл rust-clean-code
 # прямо называет ICY-метаблоки целью PBT фазы 2 (инвариант кадрировщика,
 # отсутствие паник парсера на произвольных байтах).
 proptest = "1"
+
+# Упаковка deb (фаза add-ci-release, `cargo deb`): бинарник + .desktop с
+# иконкой из hicolor — приложение появляется в меню KDE/GNOME с гербом.
+# Зависимости (libasound2 и пр.) cargo-deb вычисляет сам по линкуемым
+# библиотекам; отдельный упакованный PNG дублирует ui/app-icon.png, потому
+# что встроенная в бинарник иконка файловой системе не видна.
+[package.metadata.deb]
+section = "sound"
+# Зависимости заданы явно: авто-режим cargo-deb с раннера Ubuntu 24.04 даёт
+# libasound2t64 (пакет существует только в Ubuntu ≥24.04) и не видит
+# библиотеки, загружаемые winit/x11-dl через dlopen (ldd их не показывает).
+# libasound2 (без t64) выбран как имя, существенное и на Debian (на Ubuntu
+# 24.04 резолвится через Provides). dlopen-часть графического стека (X11/GL)
+# покрывается типичной графической сессией и в Depends не перечисляется.
+depends = ["libasound2 (>= 1.2)", "libxkbcommon0", "libxkbcommon-x11-0", "libc6", "libfontconfig1"]
+# Краткое описание для apt show: cargo-deb по умолчанию подставляет весь
+# README, а сырой markdown (бейджи, заголовки) в терминале нечитаем.
+extended-description = """\
+Нативный плеер онлайн-радио «Говорит Севастополь»: живой MP3-стрим без
+разрывов на обрывах сети, метаданные эфира (ICY) синхронно со звуком,
+окно и трей, обложки трека. Документация — на GitHub (Homepage).\
+"""
+assets = [
+    ["target/release/sevfm", "usr/bin/sevfm", "755"],
+    ["packaging/sevfm.desktop", "usr/share/applications/sevfm.desktop", "644"],
+    ["ui/app-icon.png", "usr/share/icons/hicolor/256x256/apps/sevfm.png", "644"],
+]
