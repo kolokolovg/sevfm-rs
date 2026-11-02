@@ -1,27 +1,114 @@
-// Окно плеера (design D4 add-player-ui, D7 add-album-art). Свойства и
-// callbacks связывает main.rs: poll-таймер пишет состояние, play()/stop()
-// запускают и останавливают сессию. Обложка — свойство-изображение с
-// встроенной заглушкой по умолчанию: main.rs кладёт найденную обложку
-// и возвращает заглушку для не-музыки и остановки (правило видимости
-// трек-строки).
+// Окно плеера (design D1–D6 redesign-hero-window; история: D4
+// add-player-ui, D7 add-album-art). Свойства и callbacks связывает
+// main.rs: poll-таймер пишет состояние, play()/stop() запускают и
+// останавливают сессию. Композиция «Герой-обложка»: фон — обложка
+// трека или заглушка, снизу градиент-затемнение и центрированная
+// колонка: статус с индикатором-точкой, главная строка «что в эфире»
+// (правило видимости TrackSlot), стеклянные кнопки. Отдельной строки
+// станции нет — она живёт в заголовке окна и в заглушке трек-строки.
 
-import { Button } from "std-widgets.slint";
+// Вид индикатора состояния (design D3): Rust пишет производную
+// UiState; красный вид окно выводит само из видимой ошибки.
+export enum StatusKind {
+    playing,
+    waiting,
+    stopped,
+}
+
+// Стеклянная кнопка поверх фона-обложки (design D4): свой компонент
+// вместо std-widgets — нативная кнопка не встраивается в композицию.
+// «strong» — вариант доступной кнопки (светлая заливка), иконки —
+// векторные примитивы без ассетов: Path-треугольник «Играть»,
+// квадрат «Стоп».
+component GlassButton inherits Rectangle {
+    in property <bool> enabled: true;
+    in property <string> text;
+    in property <bool> strong: false;
+    // 0 — «Играть» (треугольник), 1 — «Стоп» (квадрат).
+    in property <int> icon-kind: 0;
+    // Зазор иконка↔текст: свойство, а не литерал — ширится в формулу
+    // ширины и в spacing layout'а одним источником (находка ревью
+    // oracle: дубль рассинхронился бы при правке).
+    property <length> gap: 9px;
+    callback clicked();
+
+    height: 44px;
+    // Ширина — от контента (поля + иконка + зазор + текст), а не от
+    // parent.width: связка «ширина кнопки ← внутренний layout ←
+    // parent.width» — цикл, схлопывавший кнопку в ноль (находка
+    // ручной приёмки: «Играть» не рисовалась).
+    width: max(136px, 22px + 13px + root.gap + label.preferred-width + 22px);
+    border-radius: self.height / 2;
+    opacity: root.enabled ? 1.0 : 0.38;
+    border-width: root.strong ? 0px : 1px;
+    border-color: rgba(255, 255, 255, 0.22);
+    background: root.strong
+        ? (ta.pressed ? rgba(255, 255, 255, 0.80) : rgba(255, 255, 255, 0.94))
+        : (ta.pressed ? rgba(255, 255, 255, 0.08)
+            : ta.has-hover ? rgba(255, 255, 255, 0.18)
+            : rgba(255, 255, 255, 0.12));
+
+    ta := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+
+    HorizontalLayout {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 100%;
+        alignment: center;
+        spacing: root.gap;
+
+        // Обёртка-центровка: HorizontalLayout растягивает детей по
+        // вертикали — иконка исказилась бы без VerticalLayout.
+        VerticalLayout {
+            alignment: center;
+
+            if root.icon-kind == 0: Path {
+                width: 13px;
+                height: 15px;
+                viewbox-width: 13;
+                viewbox-height: 15;
+                commands: "M 0 0 L 13 7.5 L 0 15 Z";
+                fill: root.strong ? #14161d : #ffffff;
+            }
+            if root.icon-kind == 1: Rectangle {
+                width: 12px;
+                height: 12px;
+                border-radius: 2px;
+                background: root.strong ? #14161d : #ffffff;
+            }
+        }
+
+        label := Text {
+            text: root.text;
+            color: root.strong ? #14161d : #ffffff;
+            font-size: 15px;
+            font-weight: root.strong ? 700 : 400;
+            vertical-alignment: center;
+        }
+    }
+}
 
 export component PlayerWindow inherits Window {
     // Состояние из poll-таймера.
     in-out property <string> station;
     in-out property <string> status: "Остановлено";
+    // Индикатор состояния (design D3): производная статуса для цвета
+    // точки; лейбл остаётся строкой.
+    in-out property <StatusKind> status-kind: StatusKind.stopped;
     in-out property <string> artist;
     // `track-title`, а не `title`: title — собственное свойство Window
     // (заголовок), переопределить его нельзя.
     in-out property <string> track-title;
     in-out property <string> error;
-    // Обложка текущего трека. Дефолта нет: значение сброса — заглушка
-    // из `placeholder-cover`, Rust читает её у окна по мере надобности
-    // (в том числе из хендлеров команд трея/MPRIS — держать Image в
-    // межпоточных замыканиях нельзя, он не Send).
+    // Обложка текущего трека — фон окна. Дефолта нет: значение сброса —
+    // заглушка из `placeholder-cover`, Rust кладёт её при не-музыке и
+    // остановке (правило видимости трек-строки).
     in-out property <image> cover;
-    // Заглушка обложки: не-музыка (вставка, сырой StreamTitle), промах
+    // Заглушка фона: не-музыка (вставка, сырой StreamTitle), промах
     // поиска и сброс на новой сессии.
     in-out property <image> placeholder-cover: @image-url("cover-placeholder.png");
     // Гейты кнопок из UiState: «Играть» — только из «Остановлено».
@@ -31,94 +118,185 @@ export component PlayerWindow inherits Window {
     callback play();
     callback stop();
 
-    title: "Говорит Севастополь";
+    // Заголовок окна — живое имя станции из icy-name (спека player-ui:
+    // в окне оно видно только здесь и в заглушке трек-строки); до его
+    // получения и у станций без icy-name — имя приложения (находка
+    // ревью hunter: статичный титул врал при запуске с чужим URL).
+    title: root.station != "" ? root.station : "Говорит Севастополь";
     // Иконка окна (заголовок/таскбар) — единая иконка приложения
     // (герб Севастополя, design D6 add-tray).
     icon: @image-url("app-icon.png");
+    // Фиксированный кадр (спека player-ui «Фиксированный размер окна»):
+    // min = max = preferred, композиция рассчитана на единственный
+    // размер и не должна перестраиваться.
     preferred-width: 440px;
     preferred-height: 560px;
-    background: #14161d;
+    min-width: 440px;
+    max-width: 440px;
+    min-height: 560px;
+    max-height: 560px;
+    background: #0b0d13;
 
-    VerticalLayout {
-        padding: 24px;
-        spacing: 14px;
+    // Слои композиции (design D2, уточнение «Карточка» ручной приёмки):
+    // тёмная подложка → карточка обложки → градиент → контент.
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
 
-        // Обложка трека: найденная картинка или заглушка, contain —
-        // квадрат без искажений при любых пропорциях картинки.
-        Image {
-            height: 210px;
-            source: root.cover;
-            image-fit: ImageFit.contain;
+        // Обложка-карточка по центру: 350×350, скругление через clip
+        // (у Image нет border-radius), cover — края режутся минимально;
+        // заглушка-герб той же карточкой. Мокап «Карточка»: центр на
+        // трети высоты окна.
+        Rectangle {
+            width: 350px;
+            height: 350px;
+            x: (root.width - self.width) / 2;
+            y: root.height * 0.34 - self.height / 2;
+            border-radius: 16px;
+            clip: true;
+            drop-shadow-blur: 30px;
+            drop-shadow-color: rgba(0, 0, 0, 0.55);
+            drop-shadow-offset-y: 12px;
+
+            Image {
+                width: 100%;
+                height: 100%;
+                source: root.cover;
+                image-fit: ImageFit.cover;
+            }
         }
 
-        // Станция.
-        Text {
-            text: root.station == "" ? "—" : root.station;
-            color: #e8eaf2;
-            font-size: 22px;
-            font-weight: 700;
-            horizontal-stretch: 0;
-            overflow: elide;
+        // Градиент-затемнение нижней части: читаемость текста на
+        // светлых обложках.
+        Rectangle {
+            x: 0;
+            y: parent.height * 0.40;
+            width: parent.width;
+            height: parent.height * 0.60;
+            background: @linear-gradient(180deg,
+                rgba(11, 13, 19, 0.0) 0%,
+                rgba(11, 13, 19, 0.34) 45%,
+                rgba(11, 13, 19, 0.86) 65%,
+                #0b0d13 100%);
         }
 
-        // Статус.
-        Text {
-            text: root.status;
-            color: #8f97b8;
-            font-size: 15px;
-        }
-
-        // Трек: исполнитель и название; вставка без исполнителя — только
-        // название (строка исполнителя скрыта).
+        // Контент: спейсер прижимает блок к низу, всё по центру.
         VerticalLayout {
-            spacing: 2px;
+            x: 0;
+            y: 0;
+            width: parent.width;
+            height: parent.height;
+            padding: 26px;
+            spacing: 12px;
 
+            Rectangle { vertical-stretch: 1; }
+
+            // Статус: точка цвета состояния (красная — при видимой
+            // ошибке сессии, design D3) и лейбл.
+            HorizontalLayout {
+                alignment: center;
+                spacing: 8px;
+
+                VerticalLayout {
+                    alignment: center;
+
+                    Rectangle {
+                        width: 8px;
+                        height: 8px;
+                        border-radius: 4px;
+                        // Красный — только в паре со статусом «Остановлено»:
+                        // транзиентный тик «воркер ещё жив, исход уже Fatal»
+                        // не должен перекрашивать точку при «Воспроизведении»
+                        // (находка ревью hunter).
+                        background: root.error != "" && root.status-kind == StatusKind.stopped ? #e0526a
+                            : root.status-kind == StatusKind.playing ? #3fb96b
+                            : root.status-kind == StatusKind.waiting ? #e0a63f
+                            : #7a8098;
+                    }
+                }
+                Text {
+                    text: root.status;
+                    color: rgba(255, 255, 255, 0.72);
+                    font-size: 13px;
+                    font-weight: 500;
+                    letter-spacing: 0.8px;
+                    vertical-alignment: center;
+                }
+            }
+
+            // Главная строка «что сейчас в эфире» (design D5): трек —
+            // артист капсом (Rust пишет uppercase) и название крупно;
+            // сырой StreamTitle и заглушка-станция — одна строка (Rust
+            // кладёт станцию в track-title, отдельной ветки не нужно —
+            // находка ревью hunter: пустой Text резервировал высоту
+            // строки, статус прыгал при появлении станции).
             if root.artist != "": Text {
                 text: root.artist;
-                color: #c6cbde;
-                font-size: 16px;
+                color: rgba(255, 255, 255, 0.62);
+                font-size: 13px;
+                font-weight: 500;
+                letter-spacing: 1.2px;
+                horizontal-alignment: center;
                 overflow: elide;
             }
-
             if root.track-title != "": Text {
                 text: root.track-title;
-                color: #c6cbde;
-                font-size: 16px;
+                color: #ffffff;
+                font-size: 25px;
+                font-weight: 700;
+                horizontal-alignment: center;
                 overflow: elide;
             }
-        }
 
-        // Ошибка сессии (фатальная): показывается до следующего «Играть».
-        if root.error != "": Rectangle {
-            height: 44px;
-            border-radius: 8px;
-            background: #3a1f26;
+            // Ошибка сессии (фатальная): стеклянная красная плашка до
+            // следующего «Играть» (сброс — в command_play). Только в
+            // паре со статусом «Остановлено» — см. точку выше.
+            if root.error != "" && root.status-kind == StatusKind.stopped: HorizontalLayout {
+                alignment: center;
 
-            Text {
-                text: root.error;
-                color: #f0a0b0;
-                font-size: 13px;
-                overflow: elide;
+                Rectangle {
+                    height: 40px;
+                    width: min(error-text.preferred-width + 26px,
+                        root.width - 52px);
+                    border-radius: 10px;
+                    background: rgba(214, 54, 80, 0.22);
+                    border-width: 1px;
+                    border-color: rgba(255, 122, 142, 0.38);
+
+                    error-text := Text {
+                        x: 13px;
+                        width: parent.width - 26px;
+                        y: (parent.height - self.height) / 2;
+                        text: root.error;
+                        color: #ffb9c6;
+                        font-size: 13px;
+                        overflow: elide;
+                    }
+                }
             }
-        }
 
-        Rectangle { vertical-stretch: 1; }
+            // Управление: ровно два — «Играть» и «Стоп»; strong —
+            // доступная кнопка (гейты взаимоисключающие).
+            HorizontalLayout {
+                alignment: center;
+                spacing: 12px;
 
-        // Управление: ровно два — «Играть» и «Стоп».
-        HorizontalLayout {
-            spacing: 12px;
-            alignment: center;
-
-            Button {
-                text: "Играть";
-                enabled: root.can-play;
-                clicked => { root.play(); }
-            }
-
-            Button {
-                text: "Стоп";
-                enabled: root.can-stop;
-                clicked => { root.stop(); }
+                GlassButton {
+                    text: "Играть";
+                    icon-kind: 0;
+                    strong: root.can-play;
+                    enabled: root.can-play;
+                    clicked => { root.play(); }
+                }
+                GlassButton {
+                    text: "Стоп";
+                    icon-kind: 1;
+                    strong: root.can-stop;
+                    enabled: root.can-stop;
+                    clicked => { root.stop(); }
+                }
             }
         }
     }

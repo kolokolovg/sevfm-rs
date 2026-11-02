@@ -48,6 +48,30 @@ impl UiState {
             UiState::Reconnecting => "Переподключение",
         }
     }
+
+    /// Цветовой вид индикатора состояния окна (design D3
+    /// redesign-hero-window): производная статуса без новой информации.
+    /// Красного вида нет — окно выводит его из видимой ошибки.
+    pub fn kind(self) -> StatusKind {
+        match self {
+            UiState::Playing => StatusKind::Playing,
+            UiState::Connecting | UiState::Buffering | UiState::Reconnecting => StatusKind::Waiting,
+            UiState::Stopped => StatusKind::Stopped,
+        }
+    }
+}
+
+/// Цвет точки индикатора состояния в окне (design D3
+/// redesign-hero-window): lib не зависит от Slint, поэтому вид — свой
+/// enum, main.rs отображает его на сгенерированный enum окна.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StatusKind {
+    /// «Воспроизведение» — зелёная точка.
+    Playing,
+    /// «Подключение», «Буферизация», «Переподключение» — янтарная.
+    Waiting,
+    /// «Остановлено» — серая.
+    Stopped,
 }
 
 /// Чистый маппинг состояния окна (задача 2.1): мёртвый воркер —
@@ -342,6 +366,18 @@ mod tests {
         TrackSlot::Placeholder {
             station: station.map(str::to_owned),
         }
+    }
+
+    /// Индикатор состояния (redesign-hero-window D3): таблично все пять
+    /// статусов — зелёный только у «Воспроизведения», янтарный у трёх
+    /// «живых, но без гарантии звука», серый у «Остановлено».
+    #[test]
+    fn ui_state_kind_maps_all_statuses() {
+        assert_eq!(UiState::Playing.kind(), StatusKind::Playing);
+        assert_eq!(UiState::Connecting.kind(), StatusKind::Waiting);
+        assert_eq!(UiState::Buffering.kind(), StatusKind::Waiting);
+        assert_eq!(UiState::Reconnecting.kind(), StatusKind::Waiting);
+        assert_eq!(UiState::Stopped.kind(), StatusKind::Stopped);
     }
 
     /// Дедупликация по переходам (задача 2.2 + правило заглушек 4.3):

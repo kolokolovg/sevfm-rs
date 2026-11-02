@@ -33,7 +33,7 @@ use sevfm::icy::TrackInfo;
 use sevfm::net::{PlaybackStatus, playback_status};
 use sevfm::session::{PlayerSession, SessionHandle, SessionOutcome};
 use sevfm::tray::TraySnapshot;
-use sevfm::ui::{PlayerView, TrackSlot, UiState, parse_args};
+use sevfm::ui::{PlayerView, StatusKind as UiStatusKind, TrackSlot, UiState, parse_args};
 use sevfm::{redact_url, say};
 
 slint::include_modules!();
@@ -56,6 +56,17 @@ const JOIN_DEADLINE: Duration = Duration::from_secs(1);
 /// таймаута handshake — «чёрная дыра» в адресе шины не должна вешать
 /// старт UI дольше этого срока.
 const TRAY_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Индикатор состояния окна (design D3 redesign-hero-window): lib не
+/// зависит от Slint, поэтому вид живёт в `sevfm::ui`, а здесь —
+/// отображение на сгенерированный enum окна.
+fn window_status_kind(kind: UiStatusKind) -> StatusKind {
+    match kind {
+        UiStatusKind::Playing => StatusKind::Playing,
+        UiStatusKind::Waiting => StatusKind::Waiting,
+        UiStatusKind::Stopped => StatusKind::Stopped,
+    }
+}
 
 /// Печать эфира с дедупликацией (design D5 фазы ICY, headless-режим):
 /// станция — один раз при первом появлении, трек — при каждой смене.
@@ -172,7 +183,15 @@ fn command_play(binding: &SharedUiBinding, window: &PlayerWindow) {
             window.set_cover(placeholder_cover);
         }
         Err(e) => {
+            // Поля прошлой сессии не переживают неудачный старт:
+            // трек и обложка погашены, плашка ошибки — не поверх чужого
+            // трека (находка ревью hunter).
+            window.set_station("".into());
+            window.set_artist("".into());
+            window.set_track_title("".into());
             window.set_error(format!("не удалось запустить поток чтения: {e}").into());
+            ui.covers.invalidate();
+            window.set_cover(placeholder_cover);
         }
     }
 }
@@ -497,6 +516,7 @@ fn run_ui(binding: &SharedUiBinding, process_stop: &Arc<AtomicBool>) -> i32 {
         }
     };
     window.set_status(UiState::Stopped.label().into());
+    window.set_status_kind(window_status_kind(UiState::Stopped.kind()));
     window.set_can_play(true);
     window.set_can_stop(false);
     // Заглушка обложки — отдельное свойство окна (design D2 add-tray):
@@ -607,7 +627,13 @@ fn run_ui(binding: &SharedUiBinding, process_stop: &Arc<AtomicBool>) -> i32 {
                 let _ = slint::quit_event_loop();
             }
             let Some(window) = weak.upgrade() else { return };
-            let Ok(mut ui) = binding.lock() else { return };
+            // Отравленный замок не глушит poll-такт: паника под замком
+            // уже напечатана хуком, а глушение здесь заморозило бы
+            // окно, трей и MPRIS молча и навечно при живых командах
+            // (находка ревью hunter).
+            let mut ui = binding
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let tick = ui.session.as_ref().map(|session| session.tick());
             // Снапшот внешних поверхностей — один на такт (design D2):
             // трей обновляет свойства, MPRIS шлёт статус и метаданные;
@@ -669,7 +695,9 @@ fn run_ui(binding: &SharedUiBinding, process_stop: &Arc<AtomicBool>) -> i32 {
                         (String::new(), station.unwrap_or_default())
                     }
                 };
-                window.set_artist(artist.into());
+                // Артист капсом (design D5): у Slint нет text-transform,
+                // преобразование делает связка при записи в окно.
+                window.set_artist(artist.to_uppercase().into());
                 window.set_track_title(title.into());
             }
             // Ответы воркера обложек: устаревшие гасятся генерацией
@@ -683,6 +711,7 @@ fn run_ui(binding: &SharedUiBinding, process_stop: &Arc<AtomicBool>) -> i32 {
             }
             if let Some(status) = update.status {
                 window.set_status(status.label().into());
+                window.set_status_kind(window_status_kind(status.kind()));
                 window.set_can_play(status == UiState::Stopped);
                 window.set_can_stop(status != UiState::Stopped);
                 // Исход сессии — в stderr: ошибки в окне мимолётны, а
