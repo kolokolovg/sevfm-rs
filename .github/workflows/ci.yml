@@ -47,6 +47,13 @@ jobs:
         run: cargo fmt --all --check
       - name: Линты
         run: cargo clippy --all-targets -- -D warnings
+      # Виртуальное аудио: тест icy_metadata_printed_to_stderr печатает трек
+      # только после старта воспроизведения — на безголовом раннере без
+      # аудиоустройства процесс умирает до первого метаблока. Null-PCM даёт
+      # cpal открываемое устройство по умолчанию (данные уходят в никуда).
+      - name: Виртуальное аудио (ALSA null)
+        run: |
+          printf 'pcm.!default { type null }\nctl.!default { type null }\n' > ~/.asoundrc
       - name: Офлайн-тесты
         run: cargo test
 
