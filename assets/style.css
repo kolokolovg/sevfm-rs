@@ -95,6 +95,11 @@ code {
 .hero-sub { font-size: 21px; color: var(--text-2); margin-bottom: 20px; }
 .hero-note { color: var(--muted); max-width: 46ch; }
 
+/* SVG-бейдж статуса сборки (GitHub Actions, первая сторона) */
+.badge-imgs { list-style: none; display: flex; flex-wrap: wrap; gap: 8px; padding: 0; margin: 0 0 14px; }
+.badge-imgs li { display: inline-flex; }
+.badge-imgs img { display: block; height: 20px; border-radius: 4px; }
+
 .badges { list-style: none; display: flex; flex-wrap: wrap; gap: 8px; padding: 0; margin: 0 0 20px; }
 .badges li {
   font-size: 13px; color: var(--text-2);
@@ -104,6 +109,13 @@ code {
   padding: 4px 12px;
   white-space: nowrap;
 }
+/* Пилюля-ссылка (релизы): та же форма, но кликабельная */
+.badges li.pill-link { padding: 0; }
+.badges li.pill-link a {
+  display: block; padding: 4px 12px; color: inherit; border-radius: inherit;
+}
+.badges li.pill-link:hover { border-color: var(--accent); }
+.badges li.pill-link a:hover { color: var(--text); text-decoration: none; }
 
 .cta-row { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 26px; }
 .btn {
