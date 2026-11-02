@@ -9,6 +9,7 @@
 <meta property="og:description" content="Легковесный настольный плеер на Rust + Slint: живой MP3-стрим без обрывов, метаданные эфира, нативный интерфейс.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://kolokolovg.github.io/sevfm-rs/">
+<meta property="og:image" content="https://kolokolovg.github.io/sevfm-rs/assets/player-window.png">
 <link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
 <link rel="stylesheet" href="assets/style.css">
 </head>
@@ -52,31 +53,12 @@
       </div>
     </div>
 
-    <!-- Макет окна плеера: реставрация ui/player-window.slint -->
+    <!-- Настоящее окно плеера: скриншот живого эфира с обложкой трека -->
     <figure class="window-wrap">
-      <div class="window" role="img"
-           aria-label="Макет окна плеера: обложка, станция, статус, трек и кнопки «Играть» и «Стоп»">
-        <div class="window-titlebar">
-          <span class="dot" aria-hidden="true"></span>
-          <span class="dot" aria-hidden="true"></span>
-          <span class="dot" aria-hidden="true"></span>
-          <span class="window-title">Говорит Севастополь</span>
-        </div>
-        <div class="window-body">
-          <div class="cover"><span aria-hidden="true">♪</span></div>
-          <div class="w-station">Говорит Севастополь</div>
-          <div class="w-status"><span class="pulse" aria-hidden="true"></span>Воспроизведение</div>
-          <div class="w-track">
-            <div class="w-artist">ИСПОЛНИТЕЛЬ</div>
-            <div class="w-title">Название трека</div>
-          </div>
-          <div class="w-controls">
-            <button class="w-btn w-btn-play" type="button" tabindex="-1">Играть</button>
-            <button class="w-btn" type="button" tabindex="-1">Стоп</button>
-          </div>
-        </div>
-      </div>
-      <figcaption>Макет окна плеера — по макету <code>ui/player-window.slint</code></figcaption>
+      <img class="window-shot" src="assets/player-window.png" width="541" height="727"
+           alt="Окно плеера sevfm в живом эфире: обложка трека, станция «Говорит Севастополь», статус «Воспроизведение», исполнитель и название композиции, кнопки «Играть» и «Стоп»">
+      <figcaption>Настоящее окно плеера: живой эфир — обложка подтянута
+        цепочкой iTunes&nbsp;→ Deezer → Яндекс.Музыка</figcaption>
     </figure>
   </div>
 </section>
@@ -93,11 +75,11 @@
           данные. Долгий обрыв — пауза с автоматическим возобновлением.</p>
       </article>
       <article class="card">
-        <h3>Автопереподключение</h3>
+        <h3>Переподключение и мусор</h3>
         <p>Соединение восстанавливается с нарастающей задержкой
-          1&nbsp;→&nbsp;2&nbsp;→&nbsp;5&nbsp;→&nbsp;10&nbsp;с. Сетевые ошибки и
-          «капающий» сервер (ниже 2&nbsp;КиБ/с) не завершают плеер — только
-          переподключения с логом.</p>
+          1&nbsp;→&nbsp;2&nbsp;→&nbsp;5&nbsp;→&nbsp;10&nbsp;с. Сетевые ошибки,
+          мусор в потоке и «капающий» сервер (ниже 2&nbsp;КиБ/с) лечатся
+          переподключением, а не падением плеера.</p>
       </article>
       <article class="card">
         <h3>Метаданные эфира (ICY)</h3>
@@ -112,10 +94,10 @@
           десятки МБ RSS и минимальная нагрузка на процессор.</p>
       </article>
       <article class="card">
-        <h3>Устойчивость к мусору</h3>
-        <p>Битые кадры логируются не чаще раза в секунду, мусор в потоке
-          лечится переподключением. Коды выхода строги: 0 — штатно, 2 —
-          фатальные ошибки старта или живого цикла.</p>
+        <h3>Обложки треков</h3>
+        <p>Цепочка без API-ключей: iTunes → Deezer → Яндекс.Музыка — побеждает
+          первый найденный результат. Локальный кеш, асинхронная подгрузка без
+          блокировки звука, заглушка для вставок без исполнителя.</p>
       </article>
       <article class="card">
         <h3>Headless-режим</h3>
@@ -182,9 +164,9 @@
         <div><h3>Окно плеера на Slint</h3>
           <p>«Играть» / «Стоп», статусы, повторные сессии, headless-флаг.</p></div>
       </li>
-      <li class="tl-item wip">
-        <span class="tl-badge" aria-hidden="true">…</span>
-        <div><h3>Обложки треков <em class="tl-tag">в работе</em></h3>
+      <li class="tl-item done">
+        <span class="tl-badge" aria-hidden="true">✓</span>
+        <div><h3>Обложки треков</h3>
           <p>Цепочка публичных сервисов без API-ключей: iTunes → Deezer →
             Яндекс.Музыка, первый найденный результат побеждает; локальный кеш.</p></div>
       </li>
