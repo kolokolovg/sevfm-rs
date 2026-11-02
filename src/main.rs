@@ -515,6 +515,12 @@ fn run_ui(binding: &SharedUiBinding, process_stop: &Arc<AtomicBool>) -> i32 {
             return EXIT_FAILURE;
         }
     };
+    // Идентификатор окна (app_id на Wayland, WM_CLASS на X11): панель задач
+    // резолвит его в sevfm.desktop и показывает герб. Без app_id Wayland
+    // связать окно с приложением не может — на таскбаре заглушка.
+    // Читается адаптером при создании winit-окна (в event loop), поэтому
+    // успевает и после new(), главное — до run_event_loop.
+    slint::set_xdg_app_id("sevfm").expect("app_id задаётся при живой платформе");
     window.set_status(UiState::Stopped.label().into());
     window.set_status_kind(window_status_kind(UiState::Stopped.kind()));
     window.set_can_play(true);
