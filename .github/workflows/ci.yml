@@ -6,10 +6,13 @@
 name: CI
 
 # Теги v* не дублируют CI: их обслуживает Release на том же коммите.
+# workflow_dispatch — ручной запуск из Actions (например, после правки
+# воркфлоу или для прогона без нового коммита).
 on:
   push:
     tags-ignore: ['v*']
   pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
