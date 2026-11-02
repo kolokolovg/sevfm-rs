@@ -11,6 +11,8 @@
 | [rodio](https://crates.io/crates/rodio) | Аудиовыход: `OutputStream`/`Sink`, конвертация формата в устройство | MIT OR Apache-2.0 |
 | [cpal](https://crates.io/crates/cpal) (транзитивно через rodio) | Кроссплатформенный доступ к аудиоустройству (ALSA и др.) | Apache-2.0 |
 | [thiserror](https://crates.io/crates/thiserror) | Derive-макросы `Display`/`Error` для enum'ов ошибок (только compile-time) | MIT OR Apache-2.0 |
+| [serde_json](https://crates.io/crates/serde_json) | Разбор JSON внутри `StreamTitle` ICY-метаданных | MIT OR Apache-2.0 |
+| [proptest](https://crates.io/crates/proptest) | Property-based-тесты кадрировщика ICY-метаблоков (dev-зависимость) | MIT OR Apache-2.0 |
 | [ctrlc](https://crates.io/crates/ctrlc) 3.5.2 | Обработчик SIGINT/SIGTERM: атомарный флаг остановки | MIT |
 
 Перечисленные лицензии допускают использование библиотек в составе

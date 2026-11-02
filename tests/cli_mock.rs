@@ -186,3 +186,69 @@ fn permanent_status_exits_with_code_2() {
 
     server.stop();
 }
+
+/// Метаданные ICY доходят до пользователя (задача 3.1): станция и трек
+/// печатаются в stderr при подключении и первой смене. Строки видны ещё
+/// в стартовом цикле (до открытия аудиоустройства), поэтому тест честен и
+/// на машине без звука; SIGINT останавливает процесс с кодом 0.
+#[cfg(unix)] // сигнал доставляется утилитой kill(1)
+#[test]
+fn icy_metadata_printed_to_stderr() {
+    use std::io::BufRead;
+
+    let fixture = common::fixture_bytes();
+    let metaint = 16 * 1024;
+    // Первый блок — трек, дальше вставка: обе строки обязаны появиться.
+    let framed = common::icy_frame(
+        &fixture[..128 * 1024],
+        metaint,
+        &[
+            "{\"artist\":\"ВЛАДИМИР ТРОШИН\",\"name\":\"ЮНОСТЬ МОЯ\"}",
+            "Реклама",
+        ],
+    );
+    // Медленная выдача держит соединение: процесс живёт до SIGINT.
+    let mut server = MockServer::start(vec![Scenario::icy_paced_then_hold(
+        framed,
+        8 * 1024,
+        Duration::from_millis(20),
+        metaint,
+        "Говорит Севастополь",
+    )]);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sevfm"))
+        .arg(server.url())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("бинарник sevfm собран");
+    let stderr = child.stderr.take().expect("stderr подключён");
+    let reader = std::io::BufReader::new(stderr);
+
+    let mut seen_station = false;
+    let mut seen_track = false;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    for line in reader.lines() {
+        let Ok(line) = line else { break };
+        seen_station |= line.contains("станция: Говорит Севастополь");
+        seen_track |= line.contains("сейчас в эфире: ВЛАДИМИР ТРОШИН — ЮНОСТЬ МОЯ");
+        if (seen_station && seen_track) || Instant::now() > deadline {
+            break;
+        }
+    }
+    assert!(
+        seen_station,
+        "строка станции не появилась за 30 с (track: {seen_track})"
+    );
+    assert!(seen_track, "строка трека не появилась за 30 с");
+
+    let signalled = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .expect("утилита kill доступна");
+    assert!(signalled.success(), "SIGINT доставлен");
+    let output = child.wait_with_output().expect("процесс завершается");
+    assert_eq!(output.status.code(), Some(0), "выход по сигналу — код 0");
+
+    server.stop();
+}

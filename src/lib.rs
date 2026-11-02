@@ -17,6 +17,7 @@
 //! модули отсюда — модули bin-крейта снаружи не видны.
 
 pub mod buffer;
+pub mod icy;
 pub mod net;
 pub mod pipeline;
 
@@ -37,17 +38,23 @@ pub fn say(message: &str) {
     let _ = writeln!(stderr, "sevfm: {}", sanitize_for_terminal(message));
 }
 
-/// Управляющие байты (кроме табуляции) заменяются на U+FFFD: ESC-последовательности
-/// из скопированного URL не перерисовывают терминал, CRLF не подделывает
-/// строки лога.
+/// Управляющие байты (кроме табуляции) и невидимые bidi/формат-символы
+/// Unicode заменяются на U+FFFD: ESC-последовательности из скопированного
+/// URL не перерисовывают терминал, CRLF не подделывает строки лога, а
+/// bidi-символы (U+202A–202E, U+2066–2069, U+200B–200F, U+FEFF — это Cf,
+/// не Cc, `is_control()` их не ловит) не спуфят отображение названия трека.
 fn sanitize_for_terminal(text: &str) -> std::borrow::Cow<'_, str> {
-    if text.chars().all(|c| c == '\t' || !c.is_control()) {
+    let spoofing = |c: char| matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200B}'..='\u{200F}' | '\u{FEFF}');
+    if text
+        .chars()
+        .all(|c| c == '\t' || (!c.is_control() && !spoofing(c)))
+    {
         return std::borrow::Cow::Borrowed(text);
     }
     std::borrow::Cow::Owned(
         text.chars()
             .map(|c| {
-                if c == '\t' || !c.is_control() {
+                if c == '\t' || (!c.is_control() && !spoofing(c)) {
                     c
                 } else {
                     '\u{FFFD}'
@@ -96,6 +103,11 @@ mod tests {
         assert_eq!(
             sanitize_for_terminal("\x1b]2;подделка\x07\r\nстрока"),
             "\u{FFFD}]2;подделка\u{FFFD}\u{FFFD}\u{FFFD}строка"
+        );
+        // Bidi/формат-символы Unicode (Cf, не Cc) — тоже на замену.
+        assert_eq!(
+            sanitize_for_terminal("\u{202E}подделка\u{2066}"),
+            "\u{FFFD}подделка\u{FFFD}"
         );
     }
 

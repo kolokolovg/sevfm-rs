@@ -31,6 +31,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::buffer::RingBuffer;
+use crate::icy;
 
 /// Размер чанка чтения из сокета. Публична для интеграционных тестов
 /// (`tests/` — внешний крейт): единственный источник знания о размере.
@@ -75,6 +76,18 @@ pub const GARBAGE_BUDGET_BYTES: usize = 256 * 1024;
 /// `NO_PROGRESS_TIMEOUT`.
 const MIN_RATE_WINDOW: Duration = Duration::from_secs(10);
 const MIN_RATE_BYTES: usize = 20 * 1024;
+/// Разумный диапазон `icy-metaint`: реальные icecast-серверы шлют
+/// 8192–65536. Значение вне 512..64 КиБ — договорённость вне практики
+/// реальных серверов, трактуется как «без ICY»: поток продолжает
+/// играть без метаданных (мелкий metaint = метаблоки в аудиопути →
+/// мусорный бюджет переподключит — штатная защита design D4).
+const METAINT_MIN_BYTES: usize = 512;
+const METAINT_MAX_BYTES: usize = 64 * 1024;
+/// Лимит байтов метаданных за окно `MIN_RATE_WINDOW`: реальное радио
+/// шлёт ≈ 100–300 байтов/с; 64 КиБ за 10 с на порядки выше любого
+/// живого вещателя, но легко достижимы вредоносным сервером с мелким
+/// metaint — защита от CPU-DoS на парсинге метаблоков.
+const META_RATE_LIMIT: usize = 64 * 1024;
 
 /// User-Agent стрима.
 const USER_AGENT: &str = "sevfm-radio/1.0";
@@ -128,12 +141,26 @@ fn redact_userinfo_everywhere(text: &str) -> String {
     result
 }
 
-/// GET-запрос URL стрима с User-Agent и БЕЗ заголовка `Icy-MetaData`
-/// (фаза 1 читает чистый MP3; метаблоки ICY появятся в фазе 2).
+/// GET-запрос URL стрима с User-Agent и запросом ICY-метаданных
+/// (`Icy-MetaData: 1`). Тело ответа — `Read`: байты читаются по мере
+/// поступления, без скачивания целиком — живой поток, а не файл.
 ///
-/// Тело ответа — `Read`: байты читаются по мере поступления, без
-/// скачивания целиком — живой поток, а не файл.
-pub fn open_stream(url: &str) -> Result<Box<dyn Read + Send + Sync>, StreamError> {
+/// Возвращает тело вместе с ICY-договорённостью соединения (design D1
+/// фазы ICY): интервал метаблоков и название станции. Отсутствует
+/// `icy-metaint` (сервер без ICY), нечисловой, нулевой или вне разумного
+/// диапазона (см. `METAINT_MIN_BYTES`) — `metaint`
+/// None: легитимный режим чистого MP3 без метаданных, не ошибка.
+/// Публичен для интеграционных тестов (`tests/` — внешний крейт):
+/// сценарии мок-сервера проверяются реальным клиентом тракта.
+pub struct OpenedStream {
+    pub body: Box<dyn Read + Send + Sync>,
+    /// Интервал `icy-metaint`: байтов аудио между метаблоками.
+    pub(crate) metaint: Option<usize>,
+    /// Название станции (`icy-name`), если прислано.
+    pub(crate) icy_name: Option<String>,
+}
+
+pub fn open_stream(url: &str) -> Result<OpenedStream, StreamError> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_connect(Some(CONNECT_TIMEOUT))
         // `timeout_per_read` капирует КАЖДОЕ чтение сокета, включая
@@ -159,6 +186,7 @@ pub fn open_stream(url: &str) -> Result<Box<dyn Read + Send + Sync>, StreamError
     let response = agent
         .get(url)
         .header("User-Agent", USER_AGENT)
+        .header("Icy-MetaData", "1")
         .call()
         .map_err(|e| StreamError::Request(redact_url_in(&e.to_string(), url)))?;
 
@@ -166,7 +194,29 @@ pub fn open_stream(url: &str) -> Result<Box<dyn Read + Send + Sync>, StreamError
     if status != 200 {
         return Err(StreamError::Status(status));
     }
-    Ok(Box::new(response.into_body().into_reader()))
+    // Заголовки ICY регистронезависимы (http::HeaderMap::get); значения
+    // могут быть с пробелами — тримим перед разбором числа. Вне разумного
+    // диапазона — как «без ICY» (комментарий у METAINT_*: мусорный
+    // бюджет переподключит, поток не теряется).
+    let metaint = response
+        .headers()
+        .get("icy-metaint")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|&interval| (METAINT_MIN_BYTES..=METAINT_MAX_BYTES).contains(&interval));
+    // Название станции может быть не-ASCII (русские станции шлют UTF-8):
+    // to_str() в http-крейте отвергает такие байты, читаем сырыми с
+    // lossy-конверсией (Latin-1 станции покажутся искажённо — принятый
+    // риск в design.md фазы ICY).
+    let icy_name = response
+        .headers()
+        .get("icy-name")
+        .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned());
+    Ok(OpenedStream {
+        body: Box::new(response.into_body().into_reader()),
+        metaint,
+        icy_name,
+    })
 }
 
 /// Счётчик байтов от последнего распознаваемого MP3-кадра — мусорный
@@ -415,6 +465,7 @@ pub fn spawn_reader(
     budget: Arc<GarbageBudget>,
     link: SharedLink,
     net_status: SharedNetStatus,
+    now_playing: icy::SharedNowPlaying,
 ) -> std::io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("net-reader".into())
@@ -423,7 +474,15 @@ pub fn spawn_reader(
             // от паник-безопасности заимствований — после паники поток
             // завершается, состояние связки больше не читается.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                reader_loop(&url, &buffer, &stop, &budget, &link, &net_status)
+                reader_loop(
+                    &url,
+                    &buffer,
+                    &stop,
+                    &budget,
+                    &link,
+                    &net_status,
+                    &now_playing,
+                )
             }));
             if result.is_err() {
                 // Сначала разблокируем тракт: сбой печати (закрытый stderr,
@@ -454,6 +513,7 @@ fn reader_loop(
     budget: &GarbageBudget,
     link: &Link,
     net_status: &SharedNetStatus,
+    now_playing: &icy::SharedNowPlaying,
 ) {
     let mut state = ReaderState {
         backoff_index: 0,
@@ -466,12 +526,34 @@ fn reader_loop(
         // активирует только первый сброс декодера).
         budget.clear();
         match open_stream(url) {
-            Ok(mut body) => {
+            Ok(mut opened) => {
                 // Новая эпоха: декодер обнуляет счётчик ошибок «подряд»
                 // и возобновляет декодирование после мусорного лимита.
                 link.next_epoch();
+                // Станция печатается один раз: слот хранит название из
+                // первого соединения, где оно пришло (станция не меняется,
+                // повторные соединения молчат).
+                {
+                    let mut ether = now_playing
+                        .lock()
+                        .expect("замок эфира не отравлен: присваивание не паникует");
+                    if ether.station.is_none() {
+                        ether.station = opened.icy_name;
+                    }
+                }
+                // Кадрировщик живёт одно соединение: договорённость
+                // каждого нового ответа переустанавливается заново.
+                let mut framer = icy::IcyFramer::new(opened.metaint);
                 match pump(
-                    &mut body, buffer, stop, link, budget, net_status, &mut state,
+                    &mut opened.body,
+                    &mut framer,
+                    now_playing,
+                    buffer,
+                    stop,
+                    link,
+                    budget,
+                    net_status,
+                    &mut state,
                 ) {
                     PumpOutcome::Stopped | PumpOutcome::BufferClosed => return,
                     PumpOutcome::GarbageLimit => {
@@ -582,9 +664,14 @@ fn is_read_timeout(e: &std::io::Error) -> bool {
         .is_some_and(|ureq_err| matches!(ureq_err, ureq::Error::Timeout(_)))
 }
 
-/// Читает сокет и пишет в буфер, пока соединение живо.
+/// Читает сокет и пишет в буфер, пока соединение живо. Между сокетом и
+/// буфером — ICY-кадрировщик (design D2 фазы ICY): декодер получает
+/// только аудиобайты, метаблоки уходят в парсер трека.
+#[allow(clippy::too_many_arguments)]
 fn pump(
     body: &mut dyn Read,
+    framer: &mut icy::IcyFramer,
+    now_playing: &icy::SharedNowPlaying,
     buffer: &RingBuffer,
     stop: &AtomicBool,
     link: &Link,
@@ -601,6 +688,10 @@ fn pump(
     // NO_PROGRESS_TIMEOUT; окно просто перезапускается.
     let mut rate_window_start: Option<Instant> = None;
     let mut rate_window_bytes = 0usize;
+    // Метабайты того же окна: лимит защищает CPU от meta-flood (сервер
+    // с мелким metaint гоняет парсинг на скорости сети — сырые байты
+    // окна такой трафик не ловят, мусорный бюджет метабайты не видит).
+    let mut meta_window_bytes = 0usize;
     // Эпоха этого соединения: только reader-поток инкрементирует её,
     // за время перекачки номер не меняется.
     let epoch = link.epoch();
@@ -627,6 +718,13 @@ fn pump(
             }
             rate_window_start = Some(Instant::now());
             rate_window_bytes = 0;
+            if meta_window_bytes > META_RATE_LIMIT {
+                return PumpOutcome::Failed(format!(
+                    "поток метаданных превышает разумный объём ({META_RATE_LIMIT} байтов \
+                     за {MIN_RATE_WINDOW:?}) — соединение закрывается"
+                ));
+            }
+            meta_window_bytes = 0;
         }
         match body.read(&mut chunk) {
             Ok(0) => {
@@ -636,6 +734,9 @@ fn pump(
                 state.backoff_index = 0;
                 state.had_connection = true;
                 rate_window_start.get_or_insert_with(Instant::now);
+                // Окно скорости считает сырые байты сокета: метаблоки —
+                // тоже прогресс сервера (асимметрия с мусорным бюджетом
+                // ниже — design D4 фазы ICY).
                 rate_window_bytes += n;
                 {
                     let mut status = net_status
@@ -643,22 +744,44 @@ fn pump(
                         .expect("замок статуса не отравлен: присваивание не паникует");
                     *status = NetStatus::Streaming;
                 }
-                // Запись может блокироваться на полном буфере (backpressure)
-                // дольше окна — это наш простой, а не деградация сервера:
-                // окно переанкеруется после разблокировки.
+                // Кадрирование до буфера: аудиоучастков на одно чтение
+                // может быть несколько (метаблоки делят чанк); запись
+                // блокируется на полном буфере (backpressure) дольше окна —
+                // это наш простой, окно переанкеруется после разблокировки.
                 let write_started = Instant::now();
-                if buffer.write(&chunk[..n]).is_err() {
+                let mut audio_bytes = 0usize;
+                let mut buffer_closed = false;
+                framer.push(&chunk[..n], &mut |frame| match frame {
+                    icy::Frame::Audio(seg) => {
+                        audio_bytes += seg.len();
+                        if !buffer_closed && buffer.write(seg).is_err() {
+                            buffer_closed = true;
+                        }
+                    }
+                    icy::Frame::Meta(block) => {
+                        meta_window_bytes += block.len();
+                        if let Some(track) = icy::parse_meta(&block) {
+                            let mut ether = now_playing
+                                .lock()
+                                .expect("замок эфира не отравлен: присваивание не паникует");
+                            ether.track = Some(track);
+                        }
+                    }
+                });
+                if buffer_closed {
                     return PumpOutcome::BufferClosed;
                 }
                 if write_started.elapsed() > READ_POLL_INTERVAL {
                     rate_window_start = Some(Instant::now());
                     rate_window_bytes = 0;
+                    meta_window_bytes = 0;
                 }
                 last_progress = Instant::now();
-                // Распознавание кадров — на стороне декодера: он сбрасывает
-                // бюджет после каждого успешного кадра. Никто не сбросил —
-                // соединение несёт сплошной мусор, закрываем (design D4).
-                budget.add(n);
+                // Мусорный бюджет считает только аудиобайты: метаданные
+                // декодер не видит, они не мусор его тракта. Никто не
+                // сбросил бюджет успешным кадром — соединение несёт
+                // сплошной мусор, закрываем (design D4).
+                budget.add(audio_bytes);
                 if budget.exceeded() {
                     return PumpOutcome::GarbageBudget(format!(
                         "мусорный бюджет: {GARBAGE_BUDGET_BYTES} байтов без \

@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use sevfm::buffer::RingBuffer;
+use sevfm::icy::{SharedNowPlaying, TrackInfo};
 use sevfm::net::{
     self, GarbageBudget, Link, NetStatus, PlaybackStatus, SharedNetStatus, playback_status,
 };
@@ -37,6 +38,50 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Код выхода при ошибке запуска тракта или сбое живого цикла
 /// (спека: 0 — штатная остановка, 2 — неуспех).
 const EXIT_FAILURE: i32 = 2;
+
+/// Печать эфира с дедупликацией (design D5 фазы ICY): станция — один
+/// раз при первом появлении, трек — при каждой смене. Опрашивается из
+/// циклов статусов; будущий UI заменит печать, тракт не меняется.
+struct NowPlayingPrinter {
+    station_shown: bool,
+    last_track: Option<TrackInfo>,
+}
+
+impl NowPlayingPrinter {
+    fn new() -> Self {
+        Self {
+            station_shown: false,
+            last_track: None,
+        }
+    }
+
+    fn poll(&mut self, slot: &SharedNowPlaying) {
+        // Копия печатаемого под замком; say() — после drop'а замка:
+        // блокирующая печать (худший пайп) не держит reader в
+        // Meta-callback.
+        let (new_station, new_track) = {
+            let ether = slot
+                .lock()
+                .expect("замок эфира не отравлен: присваивание не паникует");
+            (
+                (!self.station_shown)
+                    .then(|| ether.station.clone())
+                    .flatten(),
+                (ether.track != self.last_track)
+                    .then(|| ether.track.clone())
+                    .flatten(),
+            )
+        };
+        if let Some(station) = new_station {
+            say(&format!("станция: {station}"));
+            self.station_shown = true;
+        }
+        if let Some(track) = new_track {
+            say(&format!("сейчас в эфире: {}", track.display()));
+            self.last_track = Some(track);
+        }
+    }
+}
 
 fn main() {
     std::process::exit(run());
@@ -90,6 +135,9 @@ fn run() -> i32 {
     let link = Link::shared();
     let outcome_slot: SharedOutcome = Arc::new(Mutex::new(Outcome::Running));
     let net_status: SharedNetStatus = Arc::new(Mutex::new(NetStatus::Connecting));
+    // Эфир (станция из icy-name, трек из StreamTitle) — тем же паттерном
+    // разделяемого слота, что и сетевой статус.
+    let now_playing: SharedNowPlaying = Default::default();
     // Хэндл потока не храним: паника reader'а видна через флаг в Link
     // (catch_unwind), нормальный выход потока без остановки в живом
     // тракте невозможен.
@@ -100,6 +148,7 @@ fn run() -> i32 {
         budget.clone(),
         link.clone(),
         net_status.clone(),
+        now_playing.clone(),
     ) {
         say(&format!("не удалось запустить поток чтения: {e}"));
         return EXIT_FAILURE;
@@ -107,8 +156,11 @@ fn run() -> i32 {
 
     // Предбуферизация: старт декодирования после накопления начального
     // объёма данных (спека о непрерывности). Сетевые ретраи первого
-    // соединения здесь же — выход только по сигналу.
+    // соединения здесь же — выход только по сигналу. Станция и первый
+    // трек видны уже здесь: метаданные приходят с первыми байтами.
+    let mut ether_printer = NowPlayingPrinter::new();
     while !stop.load(Ordering::SeqCst) && !buffer.is_prebuffered() {
+        ether_printer.poll(&now_playing);
         if link.reader_panicked() {
             // Паника reader'а до предбуфера (catch_unwind уже закрыл буфер
             // и напечатал диагностику): данных больше не будет.
@@ -192,6 +244,7 @@ fn run() -> i32 {
             say(&format!("состояние: {}", status.label()));
             last_status = Some(status);
         }
+        ether_printer.poll(&now_playing);
         std::thread::sleep(POLL_INTERVAL);
     }
 

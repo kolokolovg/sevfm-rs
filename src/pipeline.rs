@@ -1463,7 +1463,9 @@ mod tests {
     #[test]
     #[ignore = "живой тест: требует сеть и доступный поток"]
     fn live_stream_reads_first_64k() {
-        let mut reader = crate::net::open_stream(DEFAULT_STREAM_URL).expect("подключение");
+        let mut reader = crate::net::open_stream(DEFAULT_STREAM_URL)
+            .expect("подключение")
+            .body;
         let mut chunk = [0u8; 8192];
         let mut total = 0usize;
         while total < 64 * 1024 {

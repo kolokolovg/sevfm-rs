@@ -72,11 +72,20 @@ pub enum Body {
     Silence,
 }
 
-/// Сценарий одного соединения: HTTP-статус + тело.
+/// ICY-договорённость в ответе мока: заголовки `icy-metaint`/`icy-name`.
+#[derive(Clone)]
+pub struct IcyHeaders {
+    pub metaint: usize,
+    pub name: Option<String>,
+}
+
+/// Сценарий одного соединения: HTTP-статус + тело (+ ICY-заголовки).
 #[derive(Clone)]
 pub struct Scenario {
     pub status: u16,
     pub body: Body,
+    /// None — сервер без ICY (клиент получает чистый MP3).
+    pub icy: Option<IcyHeaders>,
 }
 
 impl Scenario {
@@ -85,6 +94,38 @@ impl Scenario {
         Self {
             status: 200,
             body: Body::BytesThenClose(bytes),
+            icy: None,
+        }
+    }
+
+    /// Поток с ICY-договорённостью: кадрированные байты (см. `icy_frame`),
+    /// ответ включает `icy-metaint`/`icy-name`, затем обрыв соединения.
+    pub fn icy_stream(bytes: Vec<u8>, metaint: usize, station: &str) -> Self {
+        Self {
+            status: 200,
+            body: Body::BytesThenClose(bytes),
+            icy: Some(IcyHeaders {
+                metaint,
+                name: Some(station.to_owned()),
+            }),
+        }
+    }
+
+    /// Медленная выдача с ICY-договорённостью: соединение держится.
+    pub fn icy_paced_then_hold(
+        bytes: Vec<u8>,
+        chunk: usize,
+        pace: Duration,
+        metaint: usize,
+        station: &str,
+    ) -> Self {
+        Self {
+            status: 200,
+            body: Body::PacedThenHold { bytes, chunk, pace },
+            icy: Some(IcyHeaders {
+                metaint,
+                name: Some(station.to_owned()),
+            }),
         }
     }
 
@@ -93,6 +134,7 @@ impl Scenario {
         Self {
             status: 200,
             body: Body::PacedThenHold { bytes, chunk, pace },
+            icy: None,
         }
     }
 
@@ -101,6 +143,7 @@ impl Scenario {
         Self {
             status: 200,
             body: Body::PacedThenClose { bytes, chunk, pace },
+            icy: None,
         }
     }
 
@@ -110,6 +153,7 @@ impl Scenario {
         Self {
             status: 200,
             body: Body::BytesThenGarbage { bytes: prefix },
+            icy: None,
         }
     }
 
@@ -119,6 +163,7 @@ impl Scenario {
         Self {
             status: 200,
             body: Body::Silence,
+            icy: None,
         }
     }
 
@@ -132,6 +177,7 @@ impl Scenario {
         Self {
             status: 200,
             body: Body::BytesThenClose(body),
+            icy: None,
         }
     }
 
@@ -140,8 +186,33 @@ impl Scenario {
         Self {
             status: code,
             body: Body::BytesThenClose(Vec::new()),
+            icy: None,
         }
     }
+}
+
+/// Собирает ICY-кадрированный поток из аудиобайтов: аудио кусками
+/// `metaint`, после каждого полного куска — метаблок с `StreamTitle`
+/// из `titles` (по циклу, содержимое выровнено кратно 16 байтов).
+/// Независимый от библиотечного фреймера построитель — оракул тестов.
+pub fn icy_frame(audio: &[u8], metaint: usize, titles: &[&str]) -> Vec<u8> {
+    assert!(!titles.is_empty(), "нужен хотя бы один StreamTitle");
+    let mut stream = Vec::new();
+    for (index, piece) in audio.chunks(metaint).enumerate() {
+        stream.extend_from_slice(piece);
+        if piece.len() < metaint {
+            break;
+        }
+        let title = titles[index % titles.len()];
+        let mut content = format!("StreamTitle='{title}';").into_bytes();
+        while content.len() % 16 != 0 {
+            content.push(0);
+        }
+        let len_byte = u8::try_from(content.len() / 16).expect("≤ 4080 байтов");
+        stream.push(len_byte);
+        stream.extend_from_slice(&content);
+    }
+    stream
 }
 
 /// Локальный мок-сервер. Останавливается в `Drop` (или явно `stop`):
@@ -149,6 +220,9 @@ impl Scenario {
 pub struct MockServer {
     listener: TcpListener,
     connections: Arc<AtomicUsize>,
+    /// Сколько запросов содержали `Icy-MetaData: 1` — договорённость
+    /// видна моку, тесты ассертят переговоры на каждом соединении.
+    icy_requests: Arc<AtomicUsize>,
     shutdown: Arc<AtomicBool>,
     accept_thread: Option<JoinHandle<()>>,
     workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
@@ -170,6 +244,7 @@ impl MockServer {
 
         let script = Arc::new(Mutex::new(script.into()));
         let connections = Arc::new(AtomicUsize::new(0));
+        let icy_requests = Arc::new(AtomicUsize::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
         let workers = Arc::new(Mutex::new(Vec::new()));
 
@@ -179,16 +254,25 @@ impl MockServer {
                 .expect("клонирование слушателя для потока accept");
             let script = script.clone();
             let connections = connections.clone();
+            let icy_requests = icy_requests.clone();
             let shutdown = shutdown.clone();
             let workers = workers.clone();
             thread::spawn(move || {
-                accept_loop(&listener, &script, &connections, &shutdown, &workers)
+                accept_loop(
+                    &listener,
+                    &script,
+                    &connections,
+                    &icy_requests,
+                    &shutdown,
+                    &workers,
+                )
             })
         };
 
         Self {
             listener,
             connections,
+            icy_requests,
             shutdown,
             accept_thread: Some(accept_thread),
             workers,
@@ -204,6 +288,11 @@ impl MockServer {
     /// Число принятых соединений (переподключения видны как рост).
     pub fn connections(&self) -> usize {
         self.connections.load(Ordering::SeqCst)
+    }
+
+    /// Число запросов с заголовком `Icy-MetaData: 1`.
+    pub fn icy_requests(&self) -> usize {
+        self.icy_requests.load(Ordering::SeqCst)
     }
 
     /// Останавливает сервер и присоединяет все потоки. Идемпотентно.
@@ -231,6 +320,7 @@ fn accept_loop(
     listener: &TcpListener,
     script: &Mutex<VecDeque<Scenario>>,
     connections: &AtomicUsize,
+    icy_requests: &Arc<AtomicUsize>,
     shutdown: &Arc<AtomicBool>,
     workers: &Mutex<Vec<JoinHandle<()>>>,
 ) {
@@ -242,8 +332,11 @@ fn accept_loop(
             Ok((stream, _)) => {
                 connections.fetch_add(1, Ordering::SeqCst);
                 let scenario = next_scenario(script);
+                let icy_requests = icy_requests.clone();
                 let shutdown = shutdown.clone();
-                let worker = thread::spawn(move || handle_connection(stream, scenario, &shutdown));
+                let worker = thread::spawn(move || {
+                    handle_connection(stream, scenario, &icy_requests, &shutdown)
+                });
                 workers
                     .lock()
                     .expect("замок воркеров не отравлен")
@@ -265,12 +358,22 @@ fn next_scenario(script: &Mutex<VecDeque<Scenario>>) -> Scenario {
 }
 
 /// Обслуживает одно соединение по сценарию.
-fn handle_connection(mut stream: TcpStream, scenario: Scenario, shutdown: &AtomicBool) {
+fn handle_connection(
+    mut stream: TcpStream,
+    scenario: Scenario,
+    icy_requests: &AtomicUsize,
+    shutdown: &AtomicBool,
+) {
     let _ = stream.set_nodelay(true);
     // Запрос вычитываем до конца заголовков: HTTP-клиент ждёт ответа
-    // только после отправки запроса.
-    read_request_head(&mut stream);
-    if write_response_head(&mut stream, scenario.status).is_err() {
+    // только после отправки запроса. Попутно считаем договорённость о
+    // метаданных — клиент обязан просить её на каждом соединении.
+    if let Some(head) = read_request_head(&mut stream)
+        && head.to_ascii_lowercase().contains("icy-metadata: 1")
+    {
+        icy_requests.fetch_add(1, Ordering::SeqCst);
+    }
+    if write_response_head(&mut stream, scenario.status, scenario.icy.as_ref()).is_err() {
         return;
     }
     match scenario.body {
@@ -333,25 +436,31 @@ fn hold_until_stop(shutdown: &AtomicBool) {
 
 /// Читает заголовки запроса до `\r\n\r\n` (потолок `REQUEST_HEAD_LIMIT`).
 /// Ошибки и таймаут не фатальны: ответ отправляется всё равно.
-fn read_request_head(stream: &mut TcpStream) {
+fn read_request_head(stream: &mut TcpStream) -> Option<String> {
     let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT));
     let mut head = Vec::new();
     let mut chunk = [0u8; 512];
     while head.len() < REQUEST_HEAD_LIMIT {
         match stream.read(&mut chunk) {
-            Ok(0) | Err(_) => return,
+            Ok(0) | Err(_) => return None,
             Ok(n) => {
                 head.extend_from_slice(&chunk[..n]);
                 if head.ends_with(b"\r\n\r\n") {
-                    return;
+                    return Some(String::from_utf8_lossy(&head).into_owned());
                 }
             }
         }
     }
+    None
 }
 
-/// Пишет строку статуса и заголовки ответа.
-fn write_response_head(stream: &mut TcpStream, status: u16) -> std::io::Result<()> {
+/// Пишет строку статуса и заголовки ответа (включая ICY-договорённость
+/// сценария, если есть).
+fn write_response_head(
+    stream: &mut TcpStream,
+    status: u16,
+    icy: Option<&IcyHeaders>,
+) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
         403 => "Forbidden",
@@ -367,8 +476,15 @@ fn write_response_head(stream: &mut TcpStream, status: u16) -> std::io::Result<(
     };
     write!(
         stream,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nConnection: close\r\n\r\n"
-    )
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nConnection: close\r\n"
+    )?;
+    if let Some(icy) = icy {
+        write!(stream, "icy-metaint: {}\r\n", icy.metaint)?;
+        if let Some(name) = &icy.name {
+            write!(stream, "icy-name: {name}\r\n")?;
+        }
+    }
+    write!(stream, "\r\n")
 }
 
 /// Детерминированный мусор (xorshift) — одинаковый между запусками.

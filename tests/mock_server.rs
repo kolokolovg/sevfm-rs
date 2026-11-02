@@ -104,7 +104,9 @@ fn stream_scenario_works_with_open_stream_client() {
     let payload = fixture[..64 * 1024].to_vec();
     let mut server = MockServer::start(vec![Scenario::stream(payload.clone())]);
 
-    let mut reader = net::open_stream(&server.url()).expect("open_stream против мока");
+    let mut reader = net::open_stream(&server.url())
+        .expect("open_stream против мока")
+        .body;
     let body = read_exact_deadline(&mut reader, payload.len(), Duration::from_secs(10));
     assert_eq!(body, payload);
 
@@ -173,7 +175,9 @@ fn garbage_scenario_streams_prefix_then_junk_forever() {
 fn non_mp3_scenario_serves_html_body() {
     let mut server = MockServer::start(vec![Scenario::non_mp3()]);
 
-    let mut reader = net::open_stream(&server.url()).expect("статус 200 — тело читается");
+    let mut reader = net::open_stream(&server.url())
+        .expect("статус 200 — тело читается")
+        .body;
     let mut body = Vec::new();
     reader
         .read_to_end(&mut body)
@@ -253,7 +257,9 @@ fn paced_scenario_feeds_chunks_with_pauses() {
         Duration::from_millis(30),
     )]);
 
-    let mut reader = net::open_stream(&server.url()).expect("медленный поток открывается");
+    let mut reader = net::open_stream(&server.url())
+        .expect("медленный поток открывается")
+        .body;
     let body = read_exact_deadline(&mut reader, payload.len(), Duration::from_secs(10));
     assert_eq!(body, payload);
     assert!(
