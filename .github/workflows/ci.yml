@@ -29,6 +29,10 @@ jobs:
   linux:
     name: fmt + clippy + тесты (ubuntu)
     runs-on: ubuntu-latest
+    # Дефолт GitHub — 360 минут: зависший тест висел бы часами (страховка
+    # от change gitverse-ci: тестовые дедлайны покрывают известные случаи,
+    # джобовый таймаут — неизвестные).
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable

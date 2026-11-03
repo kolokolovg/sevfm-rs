@@ -1,0 +1,56 @@
+# CI для GitVerse (change gitverse-ci): ворота под возможности платформы.
+# Родной каталог воркфлоуов GitVerse — .gitverse/workflows; приоритет пути
+# переключается в настройках репозитория (после переключения GitVerse
+# перестаёт читать .github/workflows — там остаются ворота GitHub:
+# полный набор fmt + clippy + тесты + windows-сборка и релизы).
+#
+# Отличия от GitHub-CI сознательны (design.md gitverse-ci, D3):
+# - только ubuntu-latest: облачные windows-раннеры у GitVerse не заявлены,
+#   джоба висела в waiting вечно; exe собирает GitHub-CI;
+# - без clippy: на GitVerse нет рабочего кэша (rust-cache молча не работает,
+#   лимиты actions/cache не опубликованы), каждый прогон собирает зависимости
+#   с нуля — clippy удваивал бы сборку в check-режиме; полный набор ворот
+#   гоняет GitHub на тех же коммитах;
+# - timeout-minutes зафиксирован: дефолт облачного раннера 15 минут, полный
+#   прогон прежнего состава шёл ~13 минут — впритык.
+# - permissions/concurrency не включены: в справочнике синтаксиса GitVerse
+#   их нет, полагаться на недокументированное поведение не будем.
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: fmt + тесты (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      # ALSA — rodio/cpal (alsa-sys), xkbcommon/fontconfig — winit и
+      # software-рендерер Slint (fontique/шрифты); без них линковка падает.
+      - name: Системные зависимости
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev
+      - name: Форматирование
+        run: cargo fmt --all --check
+      # Виртуальное аудио: тест icy_metadata_printed_to_stderr печатает трек
+      # только после старта воспроизведения — на безголовом раннере без
+      # аудиоустройства процесс умирает до первого метаблока. Null-PCM даёт
+      # cpal открываемое устройство по умолчанию (данные уходят в никуда).
+      - name: Виртуальное аудио (ALSA null)
+        run: |
+          printf 'pcm.!default { type null }\nctl.!default { type null }\n' > ~/.asoundrc
+      # Живые сетевые тесты помечены #[ignore] и не запускаются.
+      - name: Офлайн-тесты
+        run: cargo test

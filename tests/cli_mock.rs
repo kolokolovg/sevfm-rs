@@ -201,8 +201,6 @@ fn permanent_status_exits_with_code_2() {
 #[cfg(unix)] // сигнал доставляется утилитой kill(1)
 #[test]
 fn icy_metadata_printed_to_stderr() {
-    use std::io::BufRead;
-
     let fixture = common::fixture_bytes();
     let metaint = 16 * 1024;
     // Первый блок — трек, дальше вставка: обе строки обязаны появиться.
@@ -231,14 +229,55 @@ fn icy_metadata_printed_to_stderr() {
         .spawn()
         .expect("бинарник sevfm собран");
     let stderr = child.stderr.take().expect("stderr подключён");
-    let reader = std::io::BufReader::new(stderr);
+
+    // Чтение stderr — в отдельном потоке: блокирующий lines() оставлял бы
+    // дедлайн беспомощным против молчащего живого ребёнка (заклинивший
+    // пайплайн — ни новых строк, ни EOF). Канал с recv_timeout(дедлайн)
+    // закрывает и этот класс: тайм-аут убивает ребёнка и паникует с дампом
+    // всего напечатанного. Строки собираются и на успехе: паники станции и
+    // трека обязаны показать, что процесс печатал (ретраи, состояние
+    // пайплайна) — иначе диагностика глухая (флейк CI GitVerse 2026-11-03
+    // разбирали именно по такому логу).
+    let (line_tx, line_rx) = std::sync::mpsc::channel::<String>();
+    let reader = std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stderr).lines() {
+            match line {
+                Ok(l) => {
+                    if line_tx.send(l).is_err() {
+                        break;
+                    }
+                }
+                // EOF или разрыв пайпа — поток завершается, канал
+                // опустошается и отключается.
+                Err(_) => break,
+            }
+        }
+    });
 
     // Позиции первых вхождений: станция — сразу, трек — по звуку.
+    let mut lines_seen: Vec<String> = Vec::new();
     let mut station_at: Option<usize> = None;
     let mut track_at: Option<usize> = None;
-    let deadline = Instant::now() + Duration::from_secs(30);
-    for (index, line) in reader.lines().enumerate() {
-        let Ok(line) = line else { break };
+    // Запас 60 с — не для сети (мок локален), а для перегруженного
+    // шаренного раннера: трек появляется после ~1 с звучания через ALSA
+    // null, и на голодном по CPU раннере путь до метаблока растягивается.
+    // На зелёном прогоне стоимость нулевая — выход по успеху.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let line = match line_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(l) => l,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let _ = child.kill();
+                panic!(
+                    "строки не приходят 60 с (процесс убит), stderr:\n{}",
+                    lines_seen.join("\n")
+                );
+            }
+            // Канал опустел и закрылся: процесс умер, EOF.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        let index = lines_seen.len();
         if station_at.is_none() && line.contains("станция: Говорит Севастополь")
         {
             station_at = Some(index);
@@ -247,13 +286,17 @@ fn icy_metadata_printed_to_stderr() {
         {
             track_at = Some(index);
         }
-        if (station_at.is_some() && track_at.is_some()) || Instant::now() > deadline {
+        lines_seen.push(line);
+        if station_at.is_some() && track_at.is_some() {
             break;
         }
     }
+    let dump = || lines_seen.join("\n");
     let (station_at, track_at) = (
-        station_at.expect("строка станции не появилась за 30 с"),
-        track_at.expect("строка трека не появилась за 30 с"),
+        station_at
+            .unwrap_or_else(|| panic!("строка станции не появилась за 60 с, stderr:\n{}", dump())),
+        track_at
+            .unwrap_or_else(|| panic!("строка трека не появилась за 60 с, stderr:\n{}", dump())),
     );
     assert!(
         station_at < track_at,
@@ -268,6 +311,11 @@ fn icy_metadata_printed_to_stderr() {
     assert!(signalled.success(), "SIGINT доставлен");
     let output = child.wait_with_output().expect("процесс завершается");
     assert_eq!(output.status.code(), Some(0), "выход по сигналу — код 0");
+    // Ребёнок вышел — stderr в EOF, поток-читатель завершается сам;
+    // join подтверждает, что ничего не осталось за кадром.
+    reader
+        .join()
+        .expect("поток чтения stderr завершается без паники");
 
     server.stop();
 }
