@@ -59,6 +59,17 @@ Windows — `cargo build --release`; иконка exe вшивается рес�
 тега обязан совпадать с версией в `Cargo.toml`. Каждый пуш и PR проверяет
 CI: форматирование, линты, тесты (Linux) и сборку exe (Windows).
 
+## Репозитории
+
+Код публикуется в трёх хранилищах, содержание синхронно:
+
+- [GitHub](https://github.com/kolokolovg/sevfm-rs) — основной репозиторий:
+  CI, релизы, Issues.
+- [GitFlic](https://gitflic.ru/project/kolokolovg/sevfmrs) — зеркало на
+  российском хостинге.
+- [GitVerse](https://gitverse.ru/kolokolovg/sevfm-rs) — зеркало на
+  российском хостинге.
+
 ## Тесты
 
 Обычный прогон сети не требует — серверные сценарии (обрывы, мусор,
@@ -79,15 +90,6 @@ cargo test --test sigint_live -- --ignored
 
 Rust (edition 2024): `ureq` + rustls (HTTP/TLS) → `symphonia` (MP3-декодер)
 → `rodio`/`cpal` (вывод); Slint (окно, трей); `mpris-server` (D-Bus, Linux).
-
-Заметка о cargo-прокси: если `static.crates.io` недоступен напрямую
-(TLS до Fastly дропается провайдером), пропишите проксой локально
-в `~/.cargo/config.toml` — в репозиторий конфиг не коммитится:
-
-```toml
-[http]
-proxy = "http://127.0.0.1:10809"
-```
 
 ## Лицензия
 
