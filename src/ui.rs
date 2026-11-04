@@ -228,6 +228,10 @@ pub fn track_slot(tick: &SessionTick) -> TrackSlot {
 pub struct Launch {
     /// Окно не открывается, воспроизведение сразу, вывод в stderr.
     pub headless: bool,
+    /// Очистить кеш обложек и завершиться (флаг `--clear-cache`):
+    /// утилитный запуск без окна и воспроизведения (design D5
+    /// cover-cache-cleanup).
+    pub clear_cache: bool,
     /// Адрес потока (по умолчанию — станция).
     pub url: String,
 }
@@ -241,6 +245,7 @@ pub struct Launch {
 /// отклоняется здесь же).
 pub fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Launch, String> {
     let mut headless = false;
+    let mut clear_cache = false;
     let mut url = None;
     for arg in args {
         let text = arg.to_string_lossy();
@@ -249,6 +254,11 @@ pub fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<
                 return Err("флаг --headless указан дважды".into());
             }
             headless = true;
+        } else if text == "--clear-cache" {
+            if clear_cache {
+                return Err("флаг --clear-cache указан дважды".into());
+            }
+            clear_cache = true;
         } else if text.starts_with('-') && text.len() > 1 {
             return Err(format!("неизвестный флаг: {text}"));
         } else if url.is_none() {
@@ -257,9 +267,19 @@ pub fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<
             return Err("лишний позиционный аргумент — ожидается один URL".into());
         }
     }
+    // `--clear-cache` — самостоятельный утилитный запуск (design D5
+    // cover-cache-cleanup): сочетание молча игнорировало бы часть
+    // аргументов — отклоняется целиком, кеш не трогается.
+    if clear_cache && (headless || url.is_some()) {
+        return Err("флаг --clear-cache не сочетается с другими аргументами".into());
+    }
     let url = url.unwrap_or_else(|| DEFAULT_STREAM_URL.to_owned());
     validate_url(&url)?;
-    Ok(Launch { headless, url })
+    Ok(Launch {
+        headless,
+        clear_cache,
+        url,
+    })
 }
 
 /// URL запуска обязан быть http/https-адресом с хостом (design D5
@@ -635,6 +655,37 @@ mod tests {
                 .expect_err("лишний аргумент")
                 .contains("URL")
         );
+    }
+
+    /// `--clear-cache` (design D5 cover-cache-cleanup): самостоятельный
+    /// утилитный запуск — флаг один проходит, повтор и сочетание с URL
+    /// или `--headless` отклоняются; дефолтный URL проходит ту же
+    /// самопроверку константы, но запуск до сети не доходит.
+    #[test]
+    fn clear_cache_flag_is_exclusive() {
+        use std::ffi::OsString;
+
+        let args = |parts: &[&str]| parts.iter().map(OsString::from).collect::<Vec<_>>();
+
+        let launch = parse_args(args(&["--clear-cache"])).expect("флаг один валиден");
+        assert!(launch.clear_cache);
+        assert!(!launch.headless);
+
+        // Обычный запуск флага не несёт.
+        let plain = parse_args(args(&[])).expect("без флагов — обычный запуск");
+        assert!(!plain.clear_cache);
+
+        // Повтор и сочетания — ошибки с понятным сообщением.
+        for parts in [
+            vec!["--clear-cache", "--clear-cache"],
+            vec!["--clear-cache", "http://example.com/stream"],
+            vec!["http://example.com/stream", "--clear-cache"],
+            vec!["--clear-cache", "--headless"],
+            vec!["--headless", "--clear-cache"],
+        ] {
+            let err = parse_args(args(&parts)).expect_err("сочетание отклонено");
+            assert!(err.contains("--clear-cache"), "{parts:?}: {err}");
+        }
     }
 
     /// Валидация URL запуска (design D5 harden-network-resilience):

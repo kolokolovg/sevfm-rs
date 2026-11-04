@@ -34,7 +34,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use sevfm::cover::{CoverImage, CoverReply, Covers};
+use sevfm::cover::{CoverImage, CoverReply, Covers, clear_cover_cache};
 use sevfm::icy::TrackInfo;
 use sevfm::net::{PlaybackStatus, playback_status};
 use sevfm::session::{PlayerSession, SessionHandle, SessionOutcome};
@@ -55,6 +55,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Код выхода при ошибке запуска тракта или сбое живого цикла
 /// (спека: 0 — штатная остановка, 2 — неуспех).
 const EXIT_FAILURE: i32 = 2;
+/// Успешный выход (в т.ч. утилитный запуск `--clear-cache`).
+const EXIT_SUCCESS: i32 = 0;
 /// Сторожевая граница join воркера после выхода из цикла событий:
 /// закрытие окна и сигнал обязаны давать код 0 ≤ 1 с (спека player-ui).
 const JOIN_DEADLINE: Duration = Duration::from_secs(1);
@@ -409,6 +411,42 @@ fn attach_console_for_headless() {
     }
 }
 
+/// Печать результата утилитного запуска в stdout без паники на закрытом
+/// пайпе — та же дисциплина, что у [`sevfm::say`] для stderr
+/// (`sevfm --clear-cache | head` не должен заканчиваться кодом 101):
+/// код выхода важнее записи.
+fn print_line(message: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stdout().lock(), "{message}");
+}
+
+/// Русская форма множественного для «файл» (вывод `--clear-cache`):
+/// 1 файл, 2 файла, 5 файлов, 11 файлов, 21 файл.
+fn plural_files(count: u32) -> &'static str {
+    match (count / 10 % 10, count % 10) {
+        (1, _) => "файлов",
+        (_, 1) => "файл",
+        (_, 2..=4) => "файла",
+        _ => "файлов",
+    }
+}
+
+/// Освобождённый объём в человекочитаемом виде для вывода
+/// `--clear-cache` (design D5): Б → КиБ → МиБ → ГиБ по величине.
+/// Ветка ГиБ — для кешей, росших без лимита до этого change'а
+/// (находка oracle-ревью).
+fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * KIB;
+    const GIB: u64 = MIB * KIB;
+    match bytes {
+        0..KIB => format!("{bytes} Б"),
+        KIB..MIB => format!("{:.1} КиБ", bytes as f64 / KIB as f64),
+        MIB..GIB => format!("{:.1} МиБ", bytes as f64 / MIB as f64),
+        _ => format!("{:.1} ГиБ", bytes as f64 / GIB as f64),
+    }
+}
+
 fn run() -> i32 {
     let launch = match parse_args(std::env::args_os().skip(1)) {
         Ok(launch) => launch,
@@ -418,12 +456,35 @@ fn run() -> i32 {
         }
     };
 
-    // Windows: у GUI-бинаря нет консоли — headless аттачит родительскую,
-    // чтобы статусы в stderr были видны при запуске из терминала. Вызов
-    // до первого say(): стандартные хендлы читаются лениво, при записи.
+    // Windows: у GUI-бинаря нет консоли — headless и утилитный запуск
+    // `--clear-cache` аттачат родительскую, чтобы их вывод был виден при
+    // запуске из терминала. Вызов до первого say()/печати: стандартные
+    // хендлы читаются лениво, при записи.
     #[cfg(target_os = "windows")]
-    if launch.headless {
+    if launch.headless || launch.clear_cache {
         attach_console_for_headless();
+    }
+
+    // Утилитный запуск `--clear-cache` (design D5 cover-cache-cleanup):
+    // очистить кеш обложек и выйти до всего остального — ни окна, ни
+    // воспроизведения, ни воркеров. Частичная неудача — предупреждение
+    // и код 2: тихий успех при несостоявшейся очистке вводит в
+    // заблуждение (находка ревью).
+    if launch.clear_cache {
+        let (files, bytes, failed) = clear_cover_cache();
+        if failed > 0 {
+            say(&format!(
+                "кеш обложек очищен частично: не удалось удалить {failed} {} (см. журнал)",
+                plural_files(failed)
+            ));
+            return EXIT_FAILURE;
+        }
+        print_line(&format!(
+            "Кеш обложек очищен: {files} {}, освобождено {}",
+            plural_files(files),
+            format_bytes(bytes)
+        ));
+        return EXIT_SUCCESS;
     }
 
     // Флаг завершения процесса — головной стоп для любой сессии:
@@ -879,5 +940,35 @@ fn run_ui(binding: &SharedUiBinding, process_stop: &Arc<AtomicBool>) -> i32 {
             say(&format!("цикл событий завершён с ошибкой: {e}"));
             EXIT_FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Вывод `--clear-cache` (design D5): форма множественного «файл»
+    /// (1/2/5, 11, 21) и границы форматирования объёма Б → КиБ → МиБ.
+    #[test]
+    fn plural_and_byte_format_edges() {
+        assert_eq!(plural_files(0), "файлов");
+        assert_eq!(plural_files(1), "файл");
+        assert_eq!(plural_files(2), "файла");
+        assert_eq!(plural_files(5), "файлов");
+        assert_eq!(plural_files(11), "файлов");
+        assert_eq!(plural_files(21), "файл");
+        assert_eq!(plural_files(111), "файлов");
+
+        assert_eq!(format_bytes(0), "0 Б");
+        assert_eq!(format_bytes(1023), "1023 Б");
+        assert_eq!(format_bytes(1024), "1.0 КиБ");
+        assert_eq!(format_bytes(1536), "1.5 КиБ");
+        assert_eq!(format_bytes(1024 * 1024), "1.0 МиБ");
+        assert_eq!(format_bytes(3 * 1024 * 1024 + 512 * 1024), "3.5 МиБ");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 ГиБ");
+        assert_eq!(
+            format_bytes(2 * 1024 * 1024 * 1024 + 512 * 1024 * 1024),
+            "2.5 ГиБ"
+        );
     }
 }

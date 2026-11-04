@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use http::Uri;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
@@ -65,6 +65,16 @@ const USER_AGENT: &str = concat!("sevfm/", env!("CARGO_PKG_VERSION"));
 /// Возраст осиротевшего временного файла кеша, после которого он
 /// точно мусор (подчистка на старте воркера — находка ревью).
 const STALE_TEMP_AGE: Duration = Duration::from_secs(3600);
+/// Лимит суммарного размера кеша обложек (design D2 cover-cache-cleanup):
+/// замер 2026-11-04 — приток ~8 МиБ/день при медиане записи 108 КиБ;
+/// 100 МиБ ≈ две недели уникальных треков ротации, повторные звучания
+/// остаются в кеше.
+const CACHE_LIMIT_BYTES: u64 = 100 * 1024 * 1024;
+/// Порог прироста записанных обложек для повторной проверки лимита в
+/// работающем воркере (design D3 cover-cache-cleanup): ≈ дневной приток —
+/// скан каталога не чаще раза в день прослушивания, миллисекунды в
+/// потоке воркера, без таймеров и дополнительных потоков.
+const CACHE_RECHECK_DELTA_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Ошибка обращения к сервису обложек. Варианты разделяют формулировки
 /// лога (находка ревью): «недоступен» уводил бы диагностику мусорного
@@ -373,13 +383,19 @@ pub fn cached_cover_path(artist: &str, title: &str) -> Option<std::path::PathBuf
     file.is_file().then_some(file)
 }
 
-/// Обложка из кеша; повреждённый файл удаляется и считается промахом
-/// (design D4) — при следующей смене трек поищется заново.
+/// Обложка из кеша; попадание обновляет время последнего использования
+/// записи (design D1 cover-cache-cleanup) — вытеснение по лимиту удаляет
+/// давно неиспользованные первыми. Повреждённый файл удаляется и
+/// считается промахом (design D4) — при следующей смене трек поищется
+/// заново.
 fn read_cached(dir: &Path, artist: &str, title: &str) -> Option<CoverImage> {
     let file = dir.join(cache_key(artist, title) + ".jpg");
     let bytes = std::fs::read(&file).ok()?;
     match decode_jpeg(&bytes) {
-        Ok(image) => Some(image),
+        Ok(image) => {
+            touch_last_used(&file);
+            Some(image)
+        }
         Err(e) => {
             say(&format!(
                 "файл кеша обложки повреждён ({e}), удаляю: {}",
@@ -391,12 +407,34 @@ fn read_cached(dir: &Path, artist: &str, title: &str) -> Option<CoverImage> {
     }
 }
 
+/// Продление жизни записи кеша (design D1 cover-cache-cleanup): время
+/// последнего использования — mtime, вытеснение (`enforce_cache_limit`)
+/// удаляет по нему. `set_modified` есть только у открытого файла —
+/// std-путь без новой зависимости (крейт filetime не нужен). Симлинки
+/// не открываются (находка security-ревью): подменённая запись не должна
+/// трогать mtime чужого файла. Отказ (права, шеринг Windows) — тихий
+/// пропуск: политика деградирует до порядка добавления, поведение
+/// остаётся корректным.
+fn touch_last_used(file: &Path) {
+    let not_symlink =
+        |file: &Path| std::fs::symlink_metadata(file).is_ok_and(|meta| meta.is_file());
+    if !not_symlink(file) {
+        return;
+    }
+    let _ = std::fs::File::options()
+        .write(true)
+        .open(file)
+        .and_then(|file| file.set_modified(SystemTime::now()));
+}
+
 /// Запись в кеш — best effort (design D4): неудача не отменяет показ
 /// обложки, только запись в лог. Временный файл + rename в том же
 /// каталоге — атомарно, обрыв не оставляет половину; суффикс pid —
 /// параллельный экземпляр приложения пишет свой temp (находка ревью),
-/// осироты подчистит старт воркера.
-fn write_cached(dir: &Path, artist: &str, title: &str, bytes: &[u8]) {
+/// осироты подчистит старт воркера. Возвращает размер записанных байтов:
+/// воркер копит прирост для повторной проверки лимита (design D3
+/// cover-cache-cleanup); неудача — `None`.
+fn write_cached(dir: &Path, artist: &str, title: &str, bytes: &[u8]) -> Option<u64> {
     let key = cache_key(artist, title);
     let write = || -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
@@ -404,8 +442,12 @@ fn write_cached(dir: &Path, artist: &str, title: &str, bytes: &[u8]) {
         std::fs::write(&temp, bytes)?;
         std::fs::rename(temp, dir.join(format!("{key}.jpg")))
     };
-    if let Err(e) = write() {
-        say(&format!("не удалось записать кеш обложки: {e}"));
+    match write() {
+        Ok(()) => Some(bytes.len() as u64),
+        Err(e) => {
+            say(&format!("не удалось записать кеш обложки: {e}"));
+            None
+        }
     }
 }
 
@@ -432,6 +474,178 @@ fn sweep_stale_temp_files(dir: &Path) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
+}
+
+/// Вытеснение кеша по лимиту (design D4, спека album-art «Ограничение
+/// кеша обложек»): при суммарном размере записей `*.jpg` сверх лимита
+/// удаляются самые давно использовавшиеся — mtime обновляется попаданием
+/// (`read_cached`), — пока размер не войдёт в лимит. Отказ удаления
+/// отдельного файла — лог и следующая жертва (best effort, как запись
+/// кеша); `*.tmp` не трогаем: свежие могут принадлежать параллельному
+/// экземпляру, осиротевшие убирает `sweep_stale_temp_files`. `limit` —
+/// параметр: продакшн передаёт `CACHE_LIMIT_BYTES`, тесты — малые числа.
+fn enforce_cache_limit(dir: &Path, limit: u64) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        // Нет каталога — нечего вытеснять; прочий отказ (права, путь
+        // занят файлом) — одна строка в лог: граница размера не должна
+        // умирать молча (находка ревью).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            say(&format!(
+                "не удалось прочитать каталог кеша обложек {}: {e}",
+                dir.display()
+            ));
+            return;
+        }
+    };
+    // (время последнего использования, размер, путь). `DirEntry::
+    // metadata` — lstat-семантика: симлинки не собираются и не следуют
+    // по ссылке (security-ревью: подменённая запись не должна раздувать
+    // сумму размером цели и провоцировать вытеснение честных записей).
+    let mut records: Vec<(SystemTime, u64, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() || !entry.file_name().to_string_lossy().ends_with(".jpg") {
+            continue;
+        }
+        let Ok(used) = meta.modified() else { continue };
+        records.push((used, meta.len(), entry.path()));
+    }
+    let total: u64 = records.iter().map(|(_, len, _)| *len).sum();
+    // В лимите — тихий выход: чистка не событие, пока лимит не превышен.
+    let Some(mut excess) = total.checked_sub(limit) else {
+        return;
+    };
+    records.sort_by_key(|(used, _, _)| *used);
+    let (mut removed_files, mut removed_bytes) = (0u64, 0u64);
+    for (_, len, path) in &records {
+        if excess == 0 {
+            break;
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => {
+                excess = excess.saturating_sub(*len);
+                removed_files += 1;
+                removed_bytes += *len;
+            }
+            // Уже нет — параллельный экземпляр или удаление повреждённой
+            // записи: цель достигнута, не событие (находка ревью).
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                excess = excess.saturating_sub(*len);
+                removed_files += 1;
+            }
+            Err(e) => say(&format!(
+                "не удалось удалить запись кеша обложки {}: {e}",
+                path.display()
+            )),
+        }
+    }
+    say(&format!(
+        "кеш обложек: превышен лимит {limit} Б, удалено записей: {removed_files} ({removed_bytes} Б)"
+    ));
+}
+
+/// Счётчик прироста кеша с порогом повторной проверки лимита
+/// (design D3): воркер учитывает записанные байты, при пороге —
+/// повторная проверка и сброс. Порог — поле: продакшн передаёт
+/// `CACHE_RECHECK_DELTA_BYTES`, тесты — малые числа без 8 МиБ фикстур
+/// (находка oracle-ревью: out-параметр `&mut u64` не выражал инвариант
+/// сброса и не позволял протестировать границу в сборке).
+struct CacheGrowth {
+    since_check: u64,
+    delta: u64,
+}
+
+impl CacheGrowth {
+    /// Продакшн-счётчик с порогом из константы.
+    fn production() -> Self {
+        Self {
+            since_check: 0,
+            delta: CACHE_RECHECK_DELTA_BYTES,
+        }
+    }
+
+    /// Учтена запись в `bytes` байтов; `true` — прирост достиг порога,
+    /// пора проверить лимит (счётчик сброшен этим вызовом).
+    fn record(&mut self, bytes: u64) -> bool {
+        self.since_check += bytes;
+        if self.since_check >= self.delta {
+            self.since_check = 0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Очистка одного каталога кеша — слой [`clear_cover_cache`] ради
+/// тестов без env-переменных: удаляет файлы записей `*.jpg` и
+/// осиротевшие `*.tmp` (симлинки пропускаются — security-ревью), каталог
+/// остаётся. Возвращает (удалено файлов, освобождённые байты, не
+/// удалось удалить): частичная неудача обязана быть видна вызывающему —
+/// тихий успех при несостоявшейся очистке вводит в заблуждение
+/// (находка ревью).
+fn clear_cover_cache_in(dir: &Path) -> (u32, u64, u32) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        // Нет каталога — пустая очистка, не ошибка (спека album-art);
+        // прочий отказ — лог, нули.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (0, 0, 0),
+        Err(e) => {
+            say(&format!(
+                "не удалось прочитать каталог кеша обложек {}: {e}",
+                dir.display()
+            ));
+            return (0, 0, 0);
+        }
+    };
+    // `DirEntry::metadata` — lstat-семантика: симлинки пропускаются
+    // (security-ревью), ни удаление, ни цель ссылки не затрагиваются.
+    let (mut files, mut bytes, mut failed) = (0u32, 0u64, 0u32);
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let cached = meta.is_file()
+            && (name.ends_with(".jpg") || (name.starts_with('.') && name.ends_with(".tmp")));
+        if !cached {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => {
+                files += 1;
+                bytes += meta.len();
+            }
+            // Уже нет — параллельный экземпляр: цель достигнута.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                files += 1;
+            }
+            Err(e) => {
+                failed += 1;
+                say(&format!(
+                    "не удалось удалить файл кеша обложки {}: {e}",
+                    entry.path().display()
+                ));
+            }
+        }
+    }
+    (files, bytes, failed)
+}
+
+/// Полная очистка кеша обложек — флаг `--clear-cache` (спека album-art
+/// «Ручная очистка кеша обложек», design D5). Возвращает (удалено
+/// файлов, освобождённые байты, не удалось удалить) — печать и код
+/// выхода выполняет бинарник, библиотека возвращает числа. Кеш отключён
+/// (нет домашнего каталога) — успешная пустая очистка.
+pub fn clear_cover_cache() -> (u32, u64, u32) {
+    cache_dir()
+        .map(|dir| clear_cover_cache_in(&dir))
+        .unwrap_or((0, 0, 0))
 }
 
 /// Цепочка поиска (спека album-art): сервисы по порядку, первый
@@ -483,7 +697,16 @@ fn search_cover(http: &dyn CoverHttp, artist: &str, title: &str) -> Option<(Serv
 
 /// Одна загрузка обложки трека: кеш → цепочка → скачивание → декод →
 /// кеш. Все исходы логируются (задача 4.2), внешне — `Found` или `Miss`.
-fn load_cover(cache: Option<&Path>, http: &dyn CoverHttp, artist: &str, title: &str) -> CoverReply {
+/// `growth` — прирост кеша с прошлой проверки лимита: после записи
+/// пороговое решение и сама проверка — здесь (design D3
+/// cover-cache-cleanup), счётчик живёт в воркере.
+fn load_cover(
+    cache: Option<&Path>,
+    http: &dyn CoverHttp,
+    artist: &str,
+    title: &str,
+    growth: &mut CacheGrowth,
+) -> CoverReply {
     if let Some(dir) = cache
         && let Some(image) = read_cached(dir, artist, title)
     {
@@ -514,8 +737,11 @@ fn load_cover(cache: Option<&Path>, http: &dyn CoverHttp, artist: &str, title: &
             return CoverReply::Miss;
         }
     };
-    if let Some(dir) = cache {
-        write_cached(dir, artist, title, &bytes);
+    if let Some(dir) = cache
+        && let Some(written) = write_cached(dir, artist, title, &bytes)
+        && growth.record(written)
+    {
+        enforce_cache_limit(dir, CACHE_LIMIT_BYTES);
     }
     say(&format!("обложка: {} — {artist} — {title}", service.name()));
     CoverReply::Found(image)
@@ -687,7 +913,13 @@ fn worker_loop(
 ) {
     if let Some(dir) = cache.as_deref() {
         sweep_stale_temp_files(dir);
+        // Стартовая проверка лимита (design D3 cover-cache-cleanup):
+        // перезапуски начинают с лимита, долгие сессии — порог прироста
+        // в load_cover.
+        enforce_cache_limit(dir, CACHE_LIMIT_BYTES);
     }
+    // Прирост кеша с прошлой проверки лимита (design D3).
+    let mut growth = CacheGrowth::production();
     while let Ok(mut current) = requests.recv() {
         while let Ok(next) = requests.try_recv() {
             current = next;
@@ -697,6 +929,7 @@ fn worker_loop(
             http.as_ref(),
             &current.artist,
             &current.title,
+            &mut growth,
         );
         let _ = replies.send(Reply {
             generation: current.generation,
@@ -865,7 +1098,13 @@ mod tests {
             r#"{"results":[{"artworkUrl100":"https://is1-ssl.mzstatic.com/x/100x100bb.jpg"}]}"#,
         );
         http.jpeg("mzstatic");
-        let reply = load_cover(None, &http, "Артист", "Трек");
+        let reply = load_cover(
+            None,
+            &http,
+            "Артист",
+            "Трек",
+            &mut CacheGrowth::production(),
+        );
         assert!(matches!(reply, CoverReply::Found(_)), "{reply:?}");
         assert_eq!(
             http.limits_snapshot(),
@@ -938,7 +1177,13 @@ mod tests {
             r#"{"data":[{"album":{"cover_big":"https://e-cdns-images.dzcdn.net/a/1000x1000-b.jpg"}}]}"#,
         );
         http.jpeg("dzcdn");
-        let reply = load_cover(None, &http, "Артист", "Трек");
+        let reply = load_cover(
+            None,
+            &http,
+            "Артист",
+            "Трек",
+            &mut CacheGrowth::production(),
+        );
         assert!(matches!(reply, CoverReply::Found(_)), "{reply:?}");
         assert_eq!(
             http.calls_of("evil.example.com"),
@@ -1153,6 +1398,267 @@ mod tests {
         assert_eq!(read_cached(&dir, "Владимир", "Юность"), None);
         assert!(!file.exists(), "битый файл удалён");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Установка времени последнего использования записи в тестах —
+    /// тот же механизм, что `touch_last_used`, с явным моментом.
+    fn set_last_used(path: &std::path::Path, when: SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("запись кеша открывается")
+            .set_modified(when)
+            .expect("время использования обновляется");
+    }
+
+    /// Вытеснение по лимиту (design D4 cover-cache-cleanup): в лимите —
+    /// тихий no-op; сверх лимита уходят самые давно использовавшиеся и
+    /// ровно до лимита; `.tmp` и не-jpg не тронуты, каталог остаётся.
+    #[test]
+    fn enforce_cache_limit_evicts_oldest_until_limit() {
+        let dir = test_cache_dir("evict");
+        // Содержимое записей не важно — вытеснение не декодирует.
+        let old = dir.join("old.jpg");
+        let mid = dir.join("mid.jpg");
+        let new = dir.join("new.jpg");
+        for file in [&old, &mid, &new] {
+            std::fs::write(file, vec![0u8; 1000]).expect("запись кеша");
+        }
+        let stray = dir.join("note.txt");
+        let temp = dir.join(".pending.tmp");
+        std::fs::write(&stray, b"stray").expect("посторонний файл");
+        std::fs::write(&temp, b"tmp").expect("временный файл");
+        // Симлинк-обманка на большой файл (security-ревью): если сбор
+        // записей следует по ссылке, сумма раздувается до 13 000 и
+        // «ровно в лимите» ниже превращается в вытеснение.
+        #[cfg(unix)]
+        {
+            std::fs::write(dir.join("big.bin"), vec![0u8; 10_000]).expect("большой файл");
+            std::os::unix::fs::symlink("big.bin", dir.join("fake.jpg")).expect("симлинк-обманка");
+        }
+        let now = SystemTime::now();
+        set_last_used(&old, now - Duration::from_secs(3000));
+        set_last_used(&mid, now - Duration::from_secs(2000));
+        set_last_used(&new, now - Duration::from_secs(1000));
+
+        // Ровно в лимите — ничего не тронуто.
+        enforce_cache_limit(&dir, 3000);
+        for file in [&old, &mid, &new, &stray, &temp] {
+            assert!(file.is_file(), "в лимите файл жив: {}", file.display());
+        }
+        #[cfg(unix)]
+        assert!(
+            dir.join("fake.jpg").symlink_metadata().is_ok(),
+            "симлинк-обманка не считается записью"
+        );
+
+        // 3000 → 2500: уходит самая старая, свежие и посторонние живы.
+        enforce_cache_limit(&dir, 2500);
+        assert!(!old.exists(), "самая старая запись вытеснена");
+        assert!(mid.is_file() && new.is_file(), "свежие записи остались");
+        assert!(
+            stray.is_file() && temp.is_file(),
+            "не-jpg и .tmp не тронуты"
+        );
+
+        // Лимит 0 — удаляются все записи, каталог остаётся.
+        enforce_cache_limit(&dir, 0);
+        assert!(!mid.exists() && !new.exists());
+        assert!(dir.is_dir(), "каталог кеша остаётся");
+        #[cfg(unix)]
+        assert!(
+            dir.join("fake.jpg").symlink_metadata().is_ok() && dir.join("big.bin").is_file(),
+            "симлинк и его цель не тронуты"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Отказ удаления (спека album-art «Отказ удаления»): read-only
+    /// каталог не даёт unlink — чистка не паникует, файл жив; после
+    /// восстановления прав вытеснение работает. Unix--only (chmod).
+    #[cfg(unix)]
+    #[test]
+    fn enforce_cache_limit_survives_unremovable_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_cache_dir("evict-ro");
+        let file = dir.join("a.jpg");
+        std::fs::write(&file, vec![0u8; 100]).expect("запись кеша");
+
+        // unlink требует права записи на каталог: 0o555 — только чтение.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555))
+            .expect("каталог переведён в read-only");
+        enforce_cache_limit(&dir, 0);
+        assert!(file.is_file(), "unlink не удался — файл жив, паники нет");
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .expect("права восстановлены");
+        enforce_cache_limit(&dir, 0);
+        assert!(
+            !file.exists(),
+            "после восстановления прав вытеснение работает"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// LRU (design D1 cover-cache-cleanup): попадание обновляет время
+    /// использования записи — «старая, но недавно звучавшая» живёт дольше
+    /// более свежей нетронутой. Read-only запись читается (отказ touch
+    /// молча — Unix).
+    #[test]
+    fn cache_hit_renews_last_used_and_saves_from_eviction() {
+        let dir = test_cache_dir("lru");
+        write_cached(&dir, "Владимир", "Юность", &tiny_jpeg());
+        write_cached(&dir, "Анна", "Другая", &tiny_jpeg());
+        let a = dir.join(format!("{}.jpg", cache_key("Владимир", "Юность")));
+        let b = dir.join(format!("{}.jpg", cache_key("Анна", "Другая")));
+        let now = SystemTime::now();
+        set_last_used(&a, now - Duration::from_secs(3000));
+        set_last_used(&b, now - Duration::from_secs(1000));
+
+        assert!(
+            read_cached(&dir, "Владимир", "Юность").is_some(),
+            "запись читается"
+        );
+        let (used_a, used_b) = (
+            std::fs::metadata(&a)
+                .expect("метаданные живы")
+                .modified()
+                .unwrap(),
+            std::fs::metadata(&b)
+                .expect("метаданные живы")
+                .modified()
+                .unwrap(),
+        );
+        assert!(used_a > used_b, "hit обновил время использования записи");
+
+        // Лимит на одну запись: вытесняется давно не звучавшая «Другая».
+        let limit = std::fs::metadata(&a).expect("метаданные живы").len();
+        enforce_cache_limit(&dir, limit);
+        assert!(a.is_file(), "недавно использованная запись жива");
+        assert!(!b.exists(), "нетронутая запись вытеснена");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o444))
+                .expect("запись переведена в read-only");
+            assert!(
+                read_cached(&dir, "Владимир", "Юность").is_some(),
+                "чтение read-only записи работает (touch молча пропущен)"
+            );
+            std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o644))
+                .expect("права восстановлены");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Порог повторной проверки лимита (design D3) и размер записи
+    /// (задача 1.4): прирост копится и срабатывает на границе дельты,
+    /// счётчик сбрасывается проверкой; запись возвращает размер,
+    /// неудача — `None`.
+    #[test]
+    fn recheck_threshold_and_written_size() {
+        // Граница порога: дельта минус один — ещё нет, дельта — пора;
+        // срабатывание сбрасывает счётчик (после проверки прирост
+        // начинается заново).
+        let mut growth = CacheGrowth::production();
+        assert!(!growth.record(CACHE_RECHECK_DELTA_BYTES - 1));
+        assert!(growth.record(1), "ровно на дельте — проверка");
+        assert!(!growth.record(0), "после проверки счётчик с нуля");
+
+        // Малая дельта — накопление через несколько записей.
+        let mut growth = CacheGrowth {
+            since_check: 0,
+            delta: 10,
+        };
+        assert!(!growth.record(4) && !growth.record(5));
+        assert!(growth.record(1), "4+5+1 достигли дельты 10");
+
+        let dir = test_cache_dir("write-size");
+        let jpeg = tiny_jpeg();
+        assert_eq!(
+            write_cached(&dir, "Владимир", "Юность", &jpeg),
+            Some(jpeg.len() as u64)
+        );
+        // Путь каталога занят файлом — create_dir_all падает: None.
+        let occupied = std::env::temp_dir().join(format!(
+            "sevfm-cover-test-{}-write-size-file",
+            std::process::id()
+        ));
+        std::fs::write(&occupied, b"not a dir").expect("файл на месте каталога");
+        assert_eq!(
+            write_cached(&occupied, "Владимир", "Юность", &jpeg),
+            None,
+            "неудача записи — None"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&occupied);
+    }
+
+    /// Полная очистка каталога кеша (design D5): записи и осиротевшие
+    /// `.tmp` удаляются с верными счётчиками, каталог, посторонние файлы
+    /// и симлинки остаются; отсутствующий каталог — пустая очистка;
+    /// неудачи удаления видны в третьем элементе (находка ревью).
+    #[test]
+    fn clear_cover_cache_in_removes_only_cache_files() {
+        let dir = test_cache_dir("clear");
+        let jpeg_bytes = vec![0u8; 4096];
+        std::fs::write(dir.join("a.jpg"), &jpeg_bytes).expect("запись кеша");
+        std::fs::write(dir.join("b.jpg"), &jpeg_bytes).expect("запись кеша");
+        std::fs::write(dir.join(".orphan.tmp"), b"tmp").expect("осиротевший tmp");
+        std::fs::write(dir.join("note.txt"), b"x").expect("посторонний файл");
+        std::fs::create_dir(dir.join("nested")).expect("подкаталог");
+        std::fs::write(dir.join("nested/inner.jpg"), b"x").expect("файл подкаталога");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("../nested/inner.jpg", dir.join("link.jpg"))
+            .expect("симлинк-обманка");
+
+        let (files, bytes, failed) = clear_cover_cache_in(&dir);
+        assert_eq!(files, 3, "две записи и один tmp");
+        assert_eq!(bytes, jpeg_bytes.len() as u64 * 2 + 3);
+        assert_eq!(failed, 0, "успешная очистка без неудач");
+        assert!(dir.join("note.txt").is_file(), "посторонний файл жив");
+        assert!(
+            dir.join("nested/inner.jpg").is_file(),
+            "подкаталог не обходится"
+        );
+        #[cfg(unix)]
+        assert!(
+            dir.join("link.jpg").symlink_metadata().is_ok(),
+            "симлинк не трогается: ни удалением, ни целью"
+        );
+        assert!(dir.is_dir(), "каталог кеша остаётся");
+
+        // Пустой и отсутствующий каталог — пустая очистка.
+        assert_eq!(clear_cover_cache_in(&dir), (0, 0, 0));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(clear_cover_cache_in(&dir), (0, 0, 0));
+    }
+
+    /// Неудачи удаления видны вызывающему (находка ревью): read-only
+    /// каталог не даёт unlink — удалено 0, все отказы посчитаны,
+    /// паники нет. Unix--only (chmod).
+    #[cfg(unix)]
+    #[test]
+    fn clear_cover_cache_in_counts_failures() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_cache_dir("clear-fail");
+        std::fs::write(dir.join("a.jpg"), vec![0u8; 16]).expect("запись кеша");
+        std::fs::write(dir.join("b.jpg"), vec![0u8; 16]).expect("запись кеша");
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555))
+            .expect("каталог переведён в read-only");
+        let (files, bytes, failed) = clear_cover_cache_in(&dir);
+        assert_eq!((files, bytes, failed), (0, 0, 2), "обе записи не удалены");
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .expect("права восстановлены");
+        assert_eq!(clear_cover_cache_in(&dir).0, 2, "после прав — удалены");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1429,7 +1935,13 @@ mod tests {
             real: UreqCovers::new(),
             blocked: ["itunes.apple.com", "api.deezer.com"],
         };
-        let reply = load_cover(None, &http, "Эдуард Хиль", "Я очень рад");
+        let reply = load_cover(
+            None,
+            &http,
+            "Эдуард Хиль",
+            "Я очень рад",
+            &mut CacheGrowth::production(),
+        );
         let CoverReply::Found(image) = reply else {
             panic!("Яндекс не добрал обложку при недоступных iTunes и Deezer");
         };

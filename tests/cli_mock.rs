@@ -192,6 +192,127 @@ fn permanent_status_exits_with_code_2() {
     server.stop();
 }
 
+/// `--clear-cache` (design D5 cover-cache-cleanup): файлы кеша обложек
+/// удаляются, объём выводится в stdout, процесс завершается кодом 0, не
+/// открывая окна и не начиная воспроизведение. `XDG_CACHE_HOME` указывает
+/// на каталог теста — реальный кеш пользователя не трогается. Пустой кеш —
+/// код 0 с нулевым объёмом; сочетание с URL — ошибка аргументов, кеш
+/// не тронут (спека album-art «Ручная очистка кеша обложек»).
+#[test]
+fn clear_cache_removes_covers_and_exits_zero() {
+    let base = std::env::temp_dir().join(format!("sevfm-clearcache-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let covers = base.join("sevfm").join("covers");
+    std::fs::create_dir_all(&covers).expect("каталог кеша теста создаётся");
+    std::fs::write(covers.join("aaa.jpg"), vec![0u8; 4096]).expect("запись обложки");
+    std::fs::write(covers.join("bbb.jpg"), vec![0u8; 8192]).expect("запись обложки");
+    std::fs::write(covers.join(".orphan.tmp"), vec![0u8; 10]).expect("осиротевший tmp");
+
+    // Живой кеш: код 0, файлы удалены, каталог остался, объём в stdout.
+    let output = Command::new(env!("CARGO_BIN_EXE_sevfm"))
+        .arg("--clear-cache")
+        .env("XDG_CACHE_HOME", &base)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("бинарник sevfm собран");
+    assert_eq!(output.status.code(), Some(0), "очистка — код 0");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Кеш обложек очищен") && stdout.contains("освобождено"),
+        "результат в stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("3 файла"),
+        "счётчик файлов с формой множественного: {stdout}"
+    );
+    let left = std::fs::read_dir(&covers)
+        .expect("каталог кеша читается")
+        .count();
+    assert_eq!(left, 0, "файлы кеша удалены");
+
+    // Пустой кеш: код 0, нулевой объём.
+    let output = Command::new(env!("CARGO_BIN_EXE_sevfm"))
+        .arg("--clear-cache")
+        .env("XDG_CACHE_HOME", &base)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("бинарник sevfm собран");
+    assert_eq!(output.status.code(), Some(0), "пустой кеш — код 0");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("0 файлов") && stdout.contains("0 Б"),
+        "нулевая очистка в stdout: {stdout}"
+    );
+
+    // Сочетание с URL — ошибка аргументов (код 2), кеш не тронут.
+    std::fs::write(covers.join("ccc.jpg"), vec![0u8; 16]).expect("запись обложки");
+    let output = Command::new(env!("CARGO_BIN_EXE_sevfm"))
+        .args(["--clear-cache", "http://example.com/stream"])
+        .env("XDG_CACHE_HOME", &base)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("бинарник sevfm собран");
+    assert_eq!(output.status.code(), Some(2), "сочетание флагов — код 2");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("не сочетается"),
+        "диагностика в stderr: {stderr}"
+    );
+    assert!(
+        covers.join("ccc.jpg").is_file(),
+        "при ошибке аргументов кеш не удалён"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Частичная неудача `--clear-cache` (находка ревью): read-only каталог
+/// кеша не даёт unlink — процесс выходит кодом 2 с предупреждением в
+/// stderr, а не рапортует об успешной пустой очистке. Unix--only (chmod).
+#[cfg(unix)]
+#[test]
+fn clear_cache_partial_failure_exits_with_code_2() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let base = std::env::temp_dir().join(format!("sevfm-clearcache-ro-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let covers = base.join("sevfm").join("covers");
+    std::fs::create_dir_all(&covers).expect("каталог кеша теста создаётся");
+    std::fs::write(covers.join("aaa.jpg"), vec![0u8; 64]).expect("запись обложки");
+
+    // unlink требует права записи на каталог: 0o555 — только чтение.
+    std::fs::set_permissions(&covers, std::fs::Permissions::from_mode(0o555))
+        .expect("каталог кеша переведён в read-only");
+    let output = Command::new(env!("CARGO_BIN_EXE_sevfm"))
+        .arg("--clear-cache")
+        .env("XDG_CACHE_HOME", &base)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("бинарник sevfm собран");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "несостоявшаяся очистка — неуспех, а не пустой успех"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("частично"),
+        "предупреждение в stderr: {stderr}"
+    );
+    assert!(
+        covers.join("aaa.jpg").is_file(),
+        "файл не удалён (права не давали)"
+    );
+
+    std::fs::set_permissions(&covers, std::fs::Permissions::from_mode(0o755))
+        .expect("права восстановлены");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// Битый URL запуска (design D5 harden-network-resilience): адрес без
 /// схемы/хоста отклоняется при разборе аргументов — код 2 с
 /// диагностикой в stderr до сети и окна, в обоих режимах; сегодня такой
