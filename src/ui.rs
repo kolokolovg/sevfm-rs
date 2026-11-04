@@ -235,10 +235,10 @@ pub struct Launch {
 /// Разбор аргументов командной строки (design D6, без clap): флаг
 /// `--headless` в любой позиции, первый позиционный аргумент — URL.
 /// Ошибки — неизвестный флаг, повторный `--headless`, лишний
-/// позиционный аргумент: сообщение для stderr и код 2 до открытия
-/// окна. `args_os`-семантика сохранена: невалидный UTF-8 не паникует,
-/// lossy-конверсии достаточно (URL с U+FFFD не подключится с внятной
-/// диагностикой).
+/// позиционный аргумент, некорректный URL: сообщение для stderr и код 2
+/// до открытия окна. `args_os`-семантика сохранена: невалидный UTF-8 не
+/// паникует, lossy-конверсии достаточно (URL с U+FFFD не парсится и
+/// отклоняется здесь же).
 pub fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Launch, String> {
     let mut headless = false;
     let mut url = None;
@@ -257,10 +257,30 @@ pub fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<
             return Err("лишний позиционный аргумент — ожидается один URL".into());
         }
     }
-    Ok(Launch {
-        headless,
-        url: url.unwrap_or_else(|| DEFAULT_STREAM_URL.to_owned()),
-    })
+    let url = url.unwrap_or_else(|| DEFAULT_STREAM_URL.to_owned());
+    validate_url(&url)?;
+    Ok(Launch { headless, url })
+}
+
+/// URL запуска обязан быть http/https-адресом с хостом (design D5
+/// harden-network-resilience): синтаксически битый адрес сегодня был бы
+/// сетевой ошибкой без классификации — вечные переподключения без выхода.
+/// Парсер — `http::Uri`, тот же, которым ureq разберёт URL запроса:
+/// отказ переносится с первой попытки соединения на старт. Дефолтный URL
+/// станции проходит ту же проверку (самопроверка константы).
+fn validate_url(url: &str) -> Result<(), String> {
+    let parsed = url
+        .parse::<http::Uri>()
+        .map_err(|e| format!("некорректный URL {url}: {e}"))?;
+    if parsed.scheme_str() != Some("http") && parsed.scheme_str() != Some("https") {
+        return Err(format!(
+            "некорректный URL {url}: нужна схема http:// или https://"
+        ));
+    }
+    if parsed.host().is_none_or(str::is_empty) {
+        return Err(format!("некорректный URL {url}: нет хоста"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -615,5 +635,45 @@ mod tests {
                 .expect_err("лишний аргумент")
                 .contains("URL")
         );
+    }
+
+    /// Валидация URL запуска (design D5 harden-network-resilience):
+    /// таблица валидных и битых адресов + самопроверка дефолтного URL
+    /// станции (включая `--headless` без позиционного).
+    #[test]
+    fn parse_args_validates_stream_url() {
+        use std::ffi::OsString;
+
+        let args = |parts: &[&str]| parts.iter().map(OsString::from).collect::<Vec<_>>();
+
+        // Валидные: обе схемы, порт, путь, IPv6-хост.
+        for url in [
+            "http://example.com/stream",
+            "https://sevfm.ru:9006/govsev",
+            "http://127.0.0.1:8080",
+            "http://[::1]:9006/stream",
+        ] {
+            let launch = parse_args(args(&[url])).unwrap_or_else(|e| panic!("{url}: {e}"));
+            assert_eq!(launch.url, url);
+        }
+
+        // Битые: без схемы, чужая схема, без хоста, пусто, пробел,
+        // «host:port» без // (схема не http/https).
+        for url in [
+            "example.com/stream",
+            "ftp://example.com/x",
+            "http://",
+            "http://:9006/",
+            "",
+            "http://ho st/x",
+            "sevfm.ru:9006/govsev",
+        ] {
+            let err = parse_args(args(&[url])).expect_err(&format!("битый URL принят: {url:?}"));
+            assert!(err.contains("некорректный URL"), "{url:?}: {err}");
+        }
+
+        // Дефолтный URL станции валиден (в обоих режимах запуска).
+        parse_args(args(&[])).expect("дефолтный URL валиден");
+        parse_args(args(&["--headless"])).expect("дефолтный URL валиден в headless");
     }
 }

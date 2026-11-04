@@ -13,6 +13,10 @@ authors = ["Gleb Kolokolov"]
 # радио-MP3 не сжимается, лишняя поверхность ни к чему), редиректы не
 # нужны (max_redirects(0) в коде). Фаза 1 читает чистый MP3, без ICY.
 ureq = { version = "3.5", default-features = false, features = ["rustls"] }
+# Разбор URL запуска и хостов картинок обложек (design D5/D3
+# harden-network-resilience): http::Uri — тот же парсер, которым ureq
+# разбирает URL запроса; уже в дереве через ureq, своей копии не добавляет.
+http = "1"
 # MP3-декодер: стриминговый probe → покадровый next_packet/decode (без Seek,
 # в отличие от rodio::Decoder). Включены только MP3 и SIMD-оптимизации.
 symphonia = { version = "0.6", default-features = false, features = ["mp3", "opt-simd"] }

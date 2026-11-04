@@ -335,6 +335,71 @@ fn permanent_status_terminates_reader_with_fatal_flag() {
     }
 }
 
+/// Повторяемые статусы (HTTP 408/429, design D4
+/// harden-network-resilience): reader не умирает — статус трактуется
+/// как transient, идёт переподключение и данные следующего сценария
+/// попадают в буфер; фатальный флаг не поднимается.
+#[test]
+fn retryable_status_reconnects_and_streams() {
+    for status in [408, 429] {
+        let fixture = common::fixture_bytes();
+        let mut server = MockServer::start(vec![
+            Scenario::status(status),
+            Scenario::stream(fixture[..64 * 1024].to_vec()),
+        ]);
+        let buffer = RingBuffer::new(64 * 1024, 16 * 1024);
+        let stop = Arc::new(AtomicBool::new(false));
+        let budget = GarbageBudget::shared();
+        let link = Link::shared();
+        let net_status = net::SharedNetStatus::default();
+
+        let now_playing = sevfm::icy::SharedNowPlaying::default();
+        let reader = net::spawn_reader(
+            server.url(),
+            buffer.clone(),
+            stop.clone(),
+            budget,
+            link.clone(),
+            net_status,
+            now_playing,
+            sevfm::icy::SharedEtherGate::default(),
+        )
+        .expect("поток reader'а запускается в тесте");
+
+        // Первый backoff (1 с) + повторное соединение: к дедлайну в
+        // буфере обязаны быть данные второго сценария (`available` —
+        // написанные, но не прочитанные: потребитель в тесте не нужен).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while server.connections() < 2 || buffer.available() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "HTTP {status}: переподключения нет (соединений {})",
+                server.connections()
+            );
+            assert!(!link.fatal(), "HTTP {status} не поднимает фатальный флаг");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!link.fatal(), "HTTP {status} — повторяемый статус");
+        assert!(!reader.is_finished(), "reader жив и продолжает работу");
+
+        stop.store(true, Ordering::SeqCst);
+        // Ёмкость буфера равна телу сценария, потребитель в тесте нет:
+        // reader может стоять в buffer.write на condvar полного буфера —
+        // закрытие будит писателя ошибкой Closed, reader завершается
+        // детерминированно, без гонки с дедлайном наблюдателя.
+        buffer.close();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = reader.join();
+            tx.send(()).expect("наблюдатель жив");
+        });
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("остановка срабатывает и после статусного ретрая");
+
+        server.stop();
+    }
+}
+
 /// Мусорный лимит декодера закрывает соединение, буфер очищается от
 /// байтов закрытого соединения, reader переподключается и пишет данные
 /// следующего сценария с чистого листа.

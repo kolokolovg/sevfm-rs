@@ -24,12 +24,14 @@
 //! (вставка, трек без исполнителя, остановка) в сеть не ходит вовсе.
 
 use std::io::Read;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
+use http::Uri;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -44,6 +46,20 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const BODY_TIMEOUT: Duration = Duration::from_secs(15);
+/// Таймаут DNS-резолва (design D2 harden-network-resilience):
+/// симметрия со стрим-агентом `net.rs` — зависший резолв (битый NSS,
+/// отвалившийся DNS) обрывается бюджетом и трактуется как сбой сервиса,
+/// а не подвешивает единственного воркера обложек навсегда.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Лимит тела поискового ответа (design D1 harden-network-resilience):
+/// живые ответы трёх сервисов с limit=5 — единицы–десятки КиБ (замер
+/// 2026-11-02); 1 МиБ — запас на два порядка. Раньше `read_to_end` был
+/// без ограничения: гигантское или враждебное тело раздувало память.
+const SEARCH_BODY_LIMIT_BYTES: u64 = 1024 * 1024;
+/// Лимит тела картинки обложки: `cover_big`/1000x1000 — сотни КиБ;
+/// 10 МиБ покрывает любой честный ответ с запасом, декодер всё равно
+/// ограничен 4096x4096 (см. `decode_jpeg`).
+const IMAGE_BODY_LIMIT_BYTES: u64 = 10 * 1024 * 1024;
 /// User-Agent запросов к сервисам обложек (design D3).
 const USER_AGENT: &str = concat!("sevfm/", env!("CARGO_PKG_VERSION"));
 /// Возраст осиротевшего временного файла кеша, после которого он
@@ -65,11 +81,19 @@ enum CoverError {
 }
 
 /// Транспорт HTTP сервисов обложек (design D3): `get_text` — поисковые
-/// ответы, `get_bytes` — картинка. Трейт существует ради fake-транспорта
-/// в юнит-тестах; продакшн — [`UreqCovers`].
+/// ответы, `get_bytes` — картинка. Лимит тела передаёт вызывающий
+/// (design D1 harden-network-resilience): политика «сколько готовы
+/// прочитать» живёт у потребителя, транспорт только исполняет.
+/// Трейт существует ради fake-транспорта в юнит-тестах; продакшн —
+/// [`UreqCovers`].
 trait CoverHttp: Send {
-    fn get_text(&self, url: &str) -> Result<String, CoverError>;
-    fn get_bytes(&self, url: &str) -> Result<Vec<u8>, CoverError>;
+    /// Поисковый ответ как текст; тело читается с тем же лимитом.
+    fn get_text(&self, url: &str, limit_bytes: u64) -> Result<String, CoverError> {
+        let bytes = self.get_bytes(url, limit_bytes)?;
+        // Ответы каталогов — UTF-8; не-UTF-8 байты не роняют поиск.
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+    fn get_bytes(&self, url: &str, limit_bytes: u64) -> Result<Vec<u8>, CoverError>;
 }
 
 /// Сервис цепочки поиска (design D1): эндпоинт, путь к обложке в ответе
@@ -169,6 +193,54 @@ impl Service {
             Service::Yandex => format!("https://{}", url.replace("%%", "1000x1000")),
         }
     }
+
+    /// CDN-хосты картинок сервиса (design D3 harden-network-resilience):
+    /// URL картинки приходит из недоверенного ответа поиска — загружать
+    /// можно только с родных CDN сервиса; чужой хост — промах сервиса.
+    fn image_host_suffixes(self) -> &'static [&'static str] {
+        match self {
+            Service::Itunes => &["mzstatic.com"],
+            Service::Deezer => &["dzcdn.net"],
+            Service::Yandex => &["avatars.yandex.net"],
+        }
+    }
+
+    /// Доверенный ли URL картинки (design D3): схема https и хост
+    /// сервиса — совпадение по сегментам (`evil-dzcdn.net` и
+    /// `mzstatic.com.evil.ru` не проходят); двойная защита к
+    /// `https_only` агента.
+    fn trusts_image_url(self, url: &str) -> bool {
+        let Ok(uri) = url.parse::<Uri>() else {
+            return false;
+        };
+        uri.scheme_str() == Some("https")
+            && uri.host().is_some_and(|host| {
+                // DNS нечувствителен к регистру и хвостовой FQDN-точке —
+                // сравнение тоже, иначе честный ответ CDN в верхнем
+                // регистре молча терял бы обложку (находка ревью).
+                let host = host.trim_end_matches('.').to_ascii_lowercase();
+                self.image_host_suffixes()
+                    .iter()
+                    .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
+            })
+    }
+}
+
+/// Причина недоверия к URL картинки для лога (design D3, находка
+/// ревью): хост или схема — оператору видно, что именно не прошло и
+/// какую константу allowlist'а править при смене CDN.
+fn image_reject_reason(url: &str) -> String {
+    let Ok(uri) = url.parse::<Uri>() else {
+        return "URL не разбирается".to_owned();
+    };
+    match uri.host() {
+        // https уже требует trusts_image_url — сюда попадает чужой хост.
+        Some(host) if uri.scheme_str() == Some("https") => {
+            format!("чужой хост {host}")
+        }
+        Some(host) => format!("хост {host} не по https"),
+        None => "нет хоста".to_owned(),
+    }
 }
 
 /// Продакшн-транспорт поверх ureq: свой агент с таймаутами сервисов
@@ -185,6 +257,13 @@ impl UreqCovers {
             .timeout_recv_response(Some(RESPONSE_TIMEOUT))
             .timeout_per_read(Some(READ_TIMEOUT))
             .timeout_recv_body(Some(BODY_TIMEOUT))
+            // Дисциплина стрим-агента net.rs (design D2
+            // harden-network-resilience): редиректы запрещены — ответ
+            // поиска не уводит загрузку на произвольный хост; не-https
+            // отклоняется транспортом; резолв ограничен бюджетом.
+            .max_redirects(0)
+            .https_only(true)
+            .timeout_resolve(Some(RESOLVE_TIMEOUT))
             .http_status_as_error(false)
             .build()
             .new_agent();
@@ -192,14 +271,29 @@ impl UreqCovers {
     }
 }
 
-impl CoverHttp for UreqCovers {
-    fn get_text(&self, url: &str) -> Result<String, CoverError> {
-        let bytes = self.get_bytes(url)?;
-        // Ответы каталогов — UTF-8; не-UTF-8 байты не роняют поиск.
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+/// Чтение тела с лимитом (design D1 harden-network-resilience):
+/// `take(limit + 1)` различает «ровно лимит» и «сверх лимита» — при
+/// превышении прочитан лишний байт, но чтение останавливается и память
+/// ограничена `limit + 1`, а не скоростью канала за `BODY_TIMEOUT`.
+fn read_limited(reader: impl Read, limit_bytes: u64) -> Result<Vec<u8>, CoverError> {
+    let mut bytes = Vec::new();
+    reader
+        .take(limit_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| CoverError::Network(format!("чтение тела: {e}")))?;
+    if bytes.len() as u64 > limit_bytes {
+        // Огромный или враждебный ответ — вина ответа, не сети:
+        // BadResponse ведёт лог по ветке «вернул мусор», а не «недоступен»
+        // (находка ревью о таксономии CoverError).
+        return Err(CoverError::BadResponse(format!(
+            "превышен лимит тела {limit_bytes} байт"
+        )));
     }
+    Ok(bytes)
+}
 
-    fn get_bytes(&self, url: &str) -> Result<Vec<u8>, CoverError> {
+impl CoverHttp for UreqCovers {
+    fn get_bytes(&self, url: &str, limit_bytes: u64) -> Result<Vec<u8>, CoverError> {
         let response = self
             .agent
             .get(url)
@@ -210,13 +304,7 @@ impl CoverHttp for UreqCovers {
         if !(200..300).contains(&status) {
             return Err(CoverError::Network(format!("HTTP {status}")));
         }
-        let mut bytes = Vec::new();
-        response
-            .into_body()
-            .into_reader()
-            .read_to_end(&mut bytes)
-            .map_err(|e| CoverError::Network(e.to_string()))?;
-        Ok(bytes)
+        read_limited(response.into_body().into_reader(), limit_bytes)
     }
 }
 
@@ -353,8 +441,23 @@ fn search_cover(http: &dyn CoverHttp, artist: &str, title: &str) -> Option<(Serv
     for service in CHAIN {
         let url = service.search_url(artist, title);
         let outcome = http
-            .get_text(&url)
-            .and_then(|body| service.extract_cover(&body));
+            .get_text(&url, SEARCH_BODY_LIMIT_BYTES)
+            .and_then(|body| service.extract_cover(&body))
+            .map(|cover| match cover {
+                // URL картинки — из недоверенного ответа: загрузка только
+                // с родного CDN сервиса (design D3), иначе промах сервиса
+                // и цепочка идёт дальше (спека album-art); в логе — хост
+                // и причина (находка ревью).
+                Some(url) if !service.trusts_image_url(&url) => {
+                    say(&format!(
+                        "сервис обложек {}: URL картинки отклонён ({}) — пропущен",
+                        service.name(),
+                        image_reject_reason(&url)
+                    ));
+                    None
+                }
+                other => other,
+            });
         match outcome {
             Ok(Some(cover)) => return Some((service, cover)),
             Ok(None) => {}
@@ -394,7 +497,7 @@ fn load_cover(cache: Option<&Path>, http: &dyn CoverHttp, artist: &str, title: &
         ));
         return CoverReply::Miss;
     };
-    let bytes = match http.get_bytes(&cover_url) {
+    let bytes = match http.get_bytes(&cover_url, IMAGE_BODY_LIMIT_BYTES) {
         Ok(bytes) => bytes,
         Err(e) => {
             say(&format!(
@@ -456,6 +559,10 @@ pub struct Covers {
     requests: Sender<Request>,
     replies: Receiver<Reply>,
     generation: Arc<AtomicU64>,
+    /// Мёртв ли воркер (паника, design D6 harden-network-resilience):
+    /// поднявшись, глушит новые запросы — обложки не критичны, но их
+    /// исчезновение обязано быть объяснимым записью в логе, а не тишиной.
+    dead: Arc<AtomicBool>,
 }
 
 impl Covers {
@@ -470,19 +577,42 @@ impl Covers {
         let (request_tx, request_rx) = channel::<Request>();
         let (reply_tx, reply_rx) = channel::<Reply>();
         let generation = Arc::new(AtomicU64::new(0));
+        let dead = Arc::new(AtomicBool::new(false));
+        let worker_dead = dead.clone();
         // Отказ потока — деградация без обложек, не крах плеера: спека
-        // требует независимость воспроизведения от обложек.
+        // требует независимость воспроизведения от обложек. Паника
+        // воркера ловится (прецедент — symphonia в pipeline.rs): одна
+        // запись в лог и флаг «мёртв»; respawn не делаем — паника может
+        // быть систематической (баг декодера), перезапуск дал бы петлю.
         match std::thread::Builder::new()
             .name("cover-service".into())
-            .spawn(move || worker_loop(cache, http, request_rx, reply_tx))
-        {
+            .spawn(move || {
+                if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
+                    worker_loop(cache, http, request_rx, reply_tx)
+                })) {
+                    let message = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_owned())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "причина неизвестна".into());
+                    say(&format!("сервис обложек аварийно завершился: {message}"));
+                    worker_dead.store(true, Ordering::SeqCst);
+                }
+            }) {
             Ok(_) => {}
-            Err(e) => say(&format!("не удалось запустить сервис обложек: {e}")),
+            Err(e) => {
+                say(&format!("не удалось запустить сервис обложек: {e}"));
+                // Тот же контракт, что у паники (находка ревью): мёртвый
+                // воркер — тихий пропуск запросов, а не накопление их в
+                // осиротевшем канале на каждую смену трека.
+                dead.store(true, Ordering::SeqCst);
+            }
         }
         Self {
             requests: request_tx,
             replies: reply_rx,
             generation,
+            dead,
         }
     }
 
@@ -497,6 +627,11 @@ impl Covers {
     }
 
     fn request(&self, artist: &str, title: &str) {
+        // Мёртвый воркер (паника, design D6): авария уже залогирована
+        // один раз, повторы тихо пропускаются до перезапуска.
+        if self.dead.load(Ordering::SeqCst) {
+            return;
+        }
         // Снимок генерации после инкремента: любой последующий bump
         // (новый запрос или инвалидация) делает снимок устаревшим.
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -513,6 +648,13 @@ impl Covers {
     /// на не-музыку, новая сессия, закрытие окна).
     pub fn invalidate(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Мёртв ли воркер (паника или отказ спавна): потребитель
+    /// показывает заглушку сразу, не ожидая ответа, который не придёт
+    /// (спека album-art «Диагностика аварии воркера»).
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::SeqCst)
     }
 
     /// Очередной ответ воркера без ожидания; `None` — ответов нет.
@@ -577,7 +719,9 @@ mod tests {
     struct FakeHttp {
         texts: Vec<(&'static str, Result<String, String>, u64)>,
         bytes: Vec<(&'static str, Result<Vec<u8>, String>)>,
-        calls: Arc<Mutex<Vec<String>>>,
+        /// Каждое обращение — URL и переданный лимит тела: тесты политики
+        /// лимитов (design D1) сверяют лимиты поиска и картинки.
+        calls: Arc<Mutex<Vec<(String, u64)>>>,
     }
 
     impl FakeHttp {
@@ -603,21 +747,31 @@ mod tests {
                 .lock()
                 .expect("замок вызовов не отравлен")
                 .iter()
-                .filter(|url| url.contains(needle))
+                .filter(|(url, _)| url.contains(needle))
                 .count()
         }
 
         fn calls_total(&self) -> usize {
             self.calls.lock().expect("замок вызовов не отравлен").len()
         }
-    }
 
-    impl CoverHttp for FakeHttp {
-        fn get_text(&self, url: &str) -> Result<String, CoverError> {
+        /// Лимиты всех обращений по порядку — поиск/картинка.
+        fn limits_snapshot(&self) -> Vec<u64> {
             self.calls
                 .lock()
                 .expect("замок вызовов не отравлен")
-                .push(url.to_owned());
+                .iter()
+                .map(|(_, limit)| *limit)
+                .collect()
+        }
+    }
+
+    impl CoverHttp for FakeHttp {
+        fn get_text(&self, url: &str, limit_bytes: u64) -> Result<String, CoverError> {
+            self.calls
+                .lock()
+                .expect("замок вызовов не отравлен")
+                .push((url.to_owned(), limit_bytes));
             let (_, outcome, delay_ms) = self
                 .texts
                 .iter()
@@ -629,11 +783,11 @@ mod tests {
             outcome.clone().map_err(CoverError::Network)
         }
 
-        fn get_bytes(&self, url: &str) -> Result<Vec<u8>, CoverError> {
+        fn get_bytes(&self, url: &str, limit_bytes: u64) -> Result<Vec<u8>, CoverError> {
             self.calls
                 .lock()
                 .expect("замок вызовов не отравлен")
-                .push(url.to_owned());
+                .push((url.to_owned(), limit_bytes));
             self.bytes
                 .iter()
                 .find(|(needle, _)| url.contains(needle))
@@ -678,6 +832,122 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("каталог кеша теста создаётся");
         dir
+    }
+
+    /// Лимит тела (design D1 harden-network-resilience): `take(limit+1)`
+    /// различает «ровно лимит» и «сверх лимита» — чтение останавливается
+    /// на лимите + 1 байт, память не растёт со скоростью канала.
+    #[test]
+    fn read_limited_distinguishes_boundary() {
+        let body = |len: usize| vec![0u8; len];
+        let exact =
+            read_limited(std::io::Cursor::new(body(100)), 100).expect("ровно лимит проходит");
+        assert_eq!(exact.len(), 100);
+
+        let err = read_limited(std::io::Cursor::new(body(101)), 100)
+            .expect_err("лимит + 1 байт — ошибка");
+        assert!(err.to_string().contains("лимит"), "{err}");
+
+        assert!(
+            read_limited(std::io::Cursor::new(Vec::new()), 100)
+                .expect("пустое тело — валидный ответ")
+                .is_empty()
+        );
+    }
+
+    /// Поиск и картинка получают свои лимиты тела (design D1): fake
+    /// фиксирует лимит каждого обращения.
+    #[test]
+    fn search_and_image_use_their_body_limits() {
+        let mut http = FakeHttp::default();
+        http.text(
+            "itunes.apple.com/search",
+            r#"{"results":[{"artworkUrl100":"https://is1-ssl.mzstatic.com/x/100x100bb.jpg"}]}"#,
+        );
+        http.jpeg("mzstatic");
+        let reply = load_cover(None, &http, "Артист", "Трек");
+        assert!(matches!(reply, CoverReply::Found(_)), "{reply:?}");
+        assert_eq!(
+            http.limits_snapshot(),
+            vec![SEARCH_BODY_LIMIT_BYTES, IMAGE_BODY_LIMIT_BYTES],
+            "поиск — свой лимит, картинка — свой"
+        );
+    }
+
+    /// Allowlist CDN (design D3 harden-network-resilience): родные хосты
+    /// проходят, чужие и http — нет, независимо от вхождения суффикса в
+    /// середину хоста (совпадение по сегментам).
+    #[test]
+    fn image_host_allowlist_is_segmental() {
+        let cases = [
+            (
+                Service::Itunes,
+                "https://is1-ssl.mzstatic.com/image/600x600bb.jpg",
+                true,
+            ),
+            (Service::Itunes, "https://mzstatic.com.evil.ru/x.jpg", false),
+            (
+                Service::Deezer,
+                "https://e-cdns-images.dzcdn.net/cover/1000x1000-x.jpg",
+                true,
+            ),
+            (Service::Deezer, "https://evil-dzcdn.net/x.jpg", false),
+            (
+                Service::Yandex,
+                "https://avatars.yandex.net/get-music-content/x/1000x1000",
+                true,
+            ),
+            (Service::Yandex, "http://avatars.yandex.net/x", false),
+            // Чужой CDN другого сервиса — тоже нет.
+            (
+                Service::Itunes,
+                "https://e-cdns-images.dzcdn.net/x.jpg",
+                false,
+            ),
+            // Регистр и хвостовая FQDN-точка — DNS нечувствительна к ним,
+            // сравнение тоже (находка ревью: честный ответ в верхнем
+            // регистре молча терял бы обложку).
+            (
+                Service::Itunes,
+                "https://IS1-SSL.MZSTATIC.COM/image/600x600bb.jpg",
+                true,
+            ),
+            (
+                Service::Deezer,
+                "https://e-cdns-images.dzcdn.net./cover/x.jpg",
+                true,
+            ),
+        ];
+        for (service, url, trusted) in cases {
+            assert_eq!(service.trusts_image_url(url), trusted, "{url}");
+        }
+    }
+
+    /// Чужой хост картинки — промах сервиса, цепочка идёт дальше (спека
+    /// album-art «Ограниченные сетевые обращения»): iTunes возвращает URL
+    /// с чужого хоста — загрузки нет, побеждает Deezer.
+    #[test]
+    fn untrusted_image_url_falls_through_to_next_service() {
+        let mut http = FakeHttp::default();
+        http.text(
+            "itunes.apple.com/search",
+            r#"{"results":[{"artworkUrl100":"https://evil.example.com/x/100x100bb.jpg"}]}"#,
+        );
+        http.text(
+            "api.deezer.com/search",
+            r#"{"data":[{"album":{"cover_big":"https://e-cdns-images.dzcdn.net/a/1000x1000-b.jpg"}}]}"#,
+        );
+        http.jpeg("dzcdn");
+        let reply = load_cover(None, &http, "Артист", "Трек");
+        assert!(matches!(reply, CoverReply::Found(_)), "{reply:?}");
+        assert_eq!(
+            http.calls_of("evil.example.com"),
+            0,
+            "чужой хост не загружается"
+        );
+        assert_eq!(http.calls_of("itunes"), 1, "iTunes опрошен и отклонён");
+        assert_eq!(http.calls_of("api.deezer.com"), 1, "поиск Deezer");
+        assert_eq!(http.calls_of("dzcdn"), 1, "картинка Deezer с родного CDN");
     }
 
     /// URL поиска (задача 1.2): кириллица percent-кодирована, пробел —
@@ -789,16 +1059,20 @@ mod tests {
     #[test]
     fn chain_first_hit_wins_and_failures_continue() {
         // Находка первым сервисом: Deezer и Яндекс не опрашиваются.
+        // Хост картинки — родной CDN (design D3): allowlist пропускает.
         let mut http = FakeHttp::default();
         http.text(
             "itunes.apple.com",
-            r#"{"results":[{"artworkUrl100":"https://a/100x100bb.jpg"}]}"#,
+            r#"{"results":[{"artworkUrl100":"https://is1-ssl.mzstatic.com/a/100x100bb.jpg"}]}"#,
         );
-        http.jpeg("https://a/");
+        http.jpeg("mzstatic.com/a/");
         let (service, url) = search_cover(&http, "Владимир", "Юность").expect("iTunes находит");
         assert_eq!(
             (service, url.as_str()),
-            (Service::Itunes, "https://a/600x600bb.jpg")
+            (
+                Service::Itunes,
+                "https://is1-ssl.mzstatic.com/a/600x600bb.jpg"
+            )
         );
         assert_eq!(http.calls_of("deezer"), 0, "Deezer не опрашивается");
         assert_eq!(http.calls_of("yandex"), 0, "Яндекс не опрашивается");
@@ -808,7 +1082,7 @@ mod tests {
         http.text_err("itunes.apple.com", "сеть недоступна");
         http.text(
             "api.deezer.com",
-            r#"{"data":[{"album":{"cover_big":"https://d/500x500-1.jpg"}}]}"#,
+            r#"{"data":[{"album":{"cover_big":"https://e-cdns-images.dzcdn.net/d/500x500-1.jpg"}}]}"#,
         );
         let (service, _) = search_cover(&http, "Владимир", "Юность").expect("Deezer добирает");
         assert_eq!(service, Service::Deezer);
@@ -820,12 +1094,12 @@ mod tests {
         http.text("api.deezer.com", r#"{"data":[]}"#);
         http.text(
             "api.music.yandex.net",
-            r#"{"result":{"tracks":{"results":[{"coverUri":"y%%"}]}}}"#,
+            r#"{"result":{"tracks":{"results":[{"coverUri":"avatars.yandex.net/y%%"}]}}}"#,
         );
         let (service, url) = search_cover(&http, "Владимир", "Юность").expect("Яндекс добирает");
         assert_eq!(
             (service, url.as_str()),
-            (Service::Yandex, "https://y1000x1000")
+            (Service::Yandex, "https://avatars.yandex.net/y1000x1000")
         );
         assert_eq!(http.calls_total(), 3, "опрошены все три сервиса");
 
@@ -891,9 +1165,9 @@ mod tests {
         let mut http = FakeHttp::default();
         http.text(
             "itunes.apple.com",
-            r#"{"results":[{"artworkUrl100":"https://a/100x100bb.jpg"}]}"#,
+            r#"{"results":[{"artworkUrl100":"https://is1-ssl.mzstatic.com/a/100x100bb.jpg"}]}"#,
         );
-        http.jpeg("https://a/");
+        http.jpeg("mzstatic.com/a/");
         let calls = http.calls.clone();
         let covers = Covers::with_backend(Some(dir.clone()), Box::new(http));
 
@@ -929,7 +1203,7 @@ mod tests {
         let mut http = FakeHttp::default();
         http.text(
             "term=hit",
-            r#"{"results":[{"artworkUrl100":"https://a/100x100bb.jpg"}]}"#,
+            r#"{"results":[{"artworkUrl100":"https://is1-ssl.mzstatic.com/a/100x100bb.jpg"}]}"#,
         );
         http.text("term=miss", r#"{"resultCount":0,"results":[]}"#);
         // Медленный iTunes для любого запроса «slow…»: воркер застрянет
@@ -939,7 +1213,7 @@ mod tests {
         // сервисы отвечают пустыми результатами.
         http.text("api.deezer.com", r#"{"data":[]}"#);
         http.text("api.music.yandex.net", "{}");
-        http.jpeg("https://a/");
+        http.jpeg("mzstatic.com/a/");
         let covers = Covers::with_backend(None, Box::new(http));
 
         // Штатные запросы-ответы.
@@ -981,6 +1255,62 @@ mod tests {
             None,
             "лежавший в канале ответ погашен инвалидацией"
         );
+    }
+
+    /// Паника воркера (design D6 harden-network-resilience, спека
+    /// album-art «Диагностика аварии воркера»): авария фиксируется
+    /// флагом, последующие запросы тихо пропускаются — обращений к
+    /// транспорту нет, ответов нет.
+    #[test]
+    fn panicked_worker_disables_service_silently() {
+        /// Транспорт, падающий на первом же обращении (модель бага
+        /// декодера/библиотеки внутри воркера).
+        struct PanicHttp {
+            calls: Arc<Mutex<Vec<String>>>,
+        }
+        impl CoverHttp for PanicHttp {
+            fn get_text(&self, url: &str, _limit_bytes: u64) -> Result<String, CoverError> {
+                self.calls
+                    .lock()
+                    .expect("замок вызовов не отравлен")
+                    .push(url.to_owned());
+                panic!("транспорт сломан");
+            }
+            fn get_bytes(&self, url: &str, _limit_bytes: u64) -> Result<Vec<u8>, CoverError> {
+                self.calls
+                    .lock()
+                    .expect("замок вызовов не отравлен")
+                    .push(url.to_owned());
+                panic!("транспорт сломан");
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let covers = Covers::with_backend(
+            None,
+            Box::new(PanicHttp {
+                calls: calls.clone(),
+            }),
+        );
+
+        covers.track_changed(Some(("Артист", "Трек")));
+        // Смерть воркера фиксируется флагом — публичный контракт для
+        // потребителя: заглушка вместо ожидания ответа.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !covers.is_dead() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(covers.is_dead(), "паника поймана и зафиксирована");
+
+        // После аварии запросы не доходят до транспорта и ответов нет.
+        covers.track_changed(Some(("Другой", "Трек")));
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            calls.lock().expect("замок вызовов не отравлен").len(),
+            1,
+            "после аварии обращений к транспорту нет"
+        );
+        assert_eq!(covers.poll_reply(), None, "ответов мёртвого воркера нет");
     }
 
     /// Не-музыка не ходит в сеть (задача 4.1): `track_changed(None)` —
@@ -1028,12 +1358,16 @@ mod tests {
         ];
         for (service, (artist, title)) in known {
             let url = service.search_url(artist, title);
-            let body = http.get_text(&url).expect("поисковый запрос прошёл");
+            let body = http
+                .get_text(&url, SEARCH_BODY_LIMIT_BYTES)
+                .expect("поисковый запрос прошёл");
             let cover_url = service
                 .extract_cover(&body)
                 .expect("ответ парсится")
                 .unwrap_or_else(|| panic!("{} не нашёл известный трек", service.name()));
-            let bytes = http.get_bytes(&cover_url).expect("обложка скачалась");
+            let bytes = http
+                .get_bytes(&cover_url, IMAGE_BODY_LIMIT_BYTES)
+                .expect("обложка скачалась");
             let image = decode_jpeg(&bytes).expect("обложка декодируется");
             println!(
                 "живой {}: {cover_url} ({}x{})",
@@ -1076,18 +1410,18 @@ mod tests {
             blocked: [&'static str; 2],
         }
         impl CoverHttp for BlockedHttp {
-            fn get_text(&self, url: &str) -> Result<String, CoverError> {
+            fn get_text(&self, url: &str, limit_bytes: u64) -> Result<String, CoverError> {
                 if self.blocked.iter().any(|needle| url.contains(needle)) {
                     return Err(CoverError::Network("сервис отключён тестом".into()));
                 }
-                self.real.get_text(url)
+                self.real.get_text(url, limit_bytes)
             }
 
-            fn get_bytes(&self, url: &str) -> Result<Vec<u8>, CoverError> {
+            fn get_bytes(&self, url: &str, limit_bytes: u64) -> Result<Vec<u8>, CoverError> {
                 if self.blocked.iter().any(|needle| url.contains(needle)) {
                     return Err(CoverError::Network("сервис отключён тестом".into()));
                 }
-                self.real.get_bytes(url)
+                self.real.get_bytes(url, limit_bytes)
             }
         }
 

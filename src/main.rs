@@ -734,7 +734,16 @@ fn run_ui(binding: &SharedUiBinding, process_stop: &Arc<AtomicBool>) -> i32 {
                 // название, вставка и остановка — заглушка без сети.
                 match &slot {
                     TrackSlot::Track { artist, title } => {
-                        ui.covers.track_changed(Some((artist, title)));
+                        // Мёртвый воркер обложек (спека album-art
+                        // «Диагностика аварии воркера»): новые треки —
+                        // заглушка сразу; ответа не будет, а обложка
+                        // предыдущего трека не должна задерживаться на
+                        // окне (находка ревью P1).
+                        if ui.covers.is_dead() {
+                            window.set_cover(placeholder_cover.clone());
+                        } else {
+                            ui.covers.track_changed(Some((artist, title)));
+                        }
                     }
                     _ => {
                         ui.covers.track_changed(None);

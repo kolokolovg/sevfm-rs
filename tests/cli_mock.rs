@@ -192,6 +192,37 @@ fn permanent_status_exits_with_code_2() {
     server.stop();
 }
 
+/// Битый URL запуска (design D5 harden-network-resilience): адрес без
+/// схемы/хоста отклоняется при разборе аргументов — код 2 с
+/// диагностикой в stderr до сети и окна, в обоих режимах; сегодня такой
+/// адрес ретраился бы вечно как неклассифицированная сетевая ошибка.
+#[test]
+fn invalid_url_exits_with_code_2_in_both_modes() {
+    for headless in [true, false] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sevfm"));
+        if headless {
+            command.arg("--headless");
+        }
+        let output = command
+            .arg("sevfm.ru:9006/govsev")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("бинарник sevfm собран");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "битый URL, headless={headless}: код 2, stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("некорректный URL"),
+            "headless={headless}, в stderr есть диагностика: {stderr}"
+        );
+    }
+}
+
 /// Метаданные ICY доходят до пользователя, синхронно со звуком
 /// (design add-ether-sync): станция печатается сразу по соединению,
 /// трек — когда декодер прочитал аудио до смещения метаблока (после

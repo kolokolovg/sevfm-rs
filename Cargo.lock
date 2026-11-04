@@ -4321,6 +4321,7 @@ version = "0.1.3"
 dependencies = [
  "async-channel",
  "ctrlc",
+ "http",
  "image",
  "mpris-server",
  "percent-encoding",
