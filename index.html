@@ -46,7 +46,7 @@
         <li>Rust · edition 2024</li>
         <li>Apache-2.0</li>
         <li>Linux · Windows</li>
-        <li class="pill-link"><a href="https://github.com/kolokolovg/sevfm-rs/releases">v0.1.3 · релизы</a></li>
+        <li class="pill-link"><a href="https://github.com/kolokolovg/sevfm-rs/releases">v0.1.4 · релизы</a></li>
       </ul>
       <p class="hero-note">Нативный бинарник с малым потреблением памяти:
         ~23&nbsp;МБ в покое и ~34&nbsp;МБ при воспроизведении (замер PSS).
@@ -54,7 +54,7 @@
         со звуком, трей и MPRIS.</p>
       <div class="cta-row">
         <a class="btn btn-primary" href="https://github.com/kolokolovg/sevfm-rs/releases/latest">
-          Скачать v0.1.3</a>
+          Скачать v0.1.4</a>
         <a class="btn btn-ghost" href="https://github.com/kolokolovg/sevfm-rs">
           Исходники на GitHub</a>
       </div>
@@ -100,7 +100,7 @@
         <h3>Обложки и окно-«Герой»</h3>
         <p>Крупная карточка обложки текущего трека и индикатор состояния.
           Обложки ищет цепочка без API-ключей — iTunes&nbsp;→ Deezer →
-          Яндекс.Музыка, побеждает первый найденный результат; локальный кеш,
+          Яндекс.Музыка, побеждает первый найденный результат; локальный кеш с лимитом 100 МБ и командой очистки,
           асинхронная подгрузка без блокировки звука.</p>
       </article>
       <article class="card">
@@ -206,7 +206,7 @@
         <div><h3>CI и автоматические релизы</h3>
           <p>Формат, линты и тесты на каждый пуш; релизы тегом <code>v*</code>:
             deb для Linux и exe в zip для Windows —
-            <a href="https://github.com/kolokolovg/sevfm-rs/releases">v0.1.0–v0.1.3</a>.</p></div>
+            <a href="https://github.com/kolokolovg/sevfm-rs/releases">v0.1.0–v0.1.4</a>.</p></div>
       </li>
     </ul>
     <p class="section-lead">Поведение зафиксировано спецификациями в
@@ -220,9 +220,9 @@
     <h2>Установка и сборка</h2>
     <p class="section-lead">Готовые пакеты — на
       <a href="https://github.com/kolokolovg/sevfm-rs/releases">странице релизов</a>:
-      <code>sevfm_0.1.3_amd64.deb</code> для Linux (собран на Ubuntu&nbsp;24.04,
+      <code>sevfm_0.1.4_amd64.deb</code> для Linux (собран на Ubuntu&nbsp;24.04,
       нужен glibc&nbsp;≥&nbsp;2.39; ярлык и герб появляются в меню приложений)
-      и <code>sevfm-0.1.3-windows-x64.zip</code> с <code>sevfm.exe</code>
+      и <code>sevfm-0.1.4-windows-x64.zip</code> с <code>sevfm.exe</code>
       для Windows. Релизы выпускаются автоматически тегом <code>v*</code>.</p>
     <p class="section-lead">Или соберите из исходников:</p>
     <div class="build-grid">
@@ -274,7 +274,7 @@ cargo test --test sigint_live -- --ignored</code></pre>
 
 <footer class="site-footer">
   <div class="container footer-row">
-    <p><span class="brand-note" aria-hidden="true">♪</span> sevfm v0.1.3 ·
+    <p><span class="brand-note" aria-hidden="true">♪</span> sevfm v0.1.4 ·
       порт <abbr title="оригинальная версия плеера на Java">Java-версии</abbr> ·
       автор — Gleb Kolokolov</p>
     <p class="footer-links">
