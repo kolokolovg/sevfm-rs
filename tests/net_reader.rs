@@ -291,12 +291,14 @@ fn unreachable_server_means_retries_not_failure() {
         .expect("остановка срабатывает и на ретраях");
 }
 
-/// Перманентный отказ (редирект 301 и HTTP 404): reader завершается,
-/// `Link` поднимает фатальный флаг — повторные попытки бессмысленны
-/// (буфер закрывается).
+/// Перманентный отказ первого соединения (редирект 301, HTTP 403 и 404):
+/// reader завершается, `Link` поднимает фатальный флаг — повторные
+/// попытки бессмысленны (буфер закрывается). 403 входит в таблицу с обеих
+/// сторон границы design D1 stream-reconnect-retry: на первом соединении
+/// фатален, на переподключении — повторяем (`rejected_reconnect_…`).
 #[test]
 fn permanent_status_terminates_reader_with_fatal_flag() {
-    for status in [301, 404] {
+    for status in [301, 403, 404] {
         let mut server = MockServer::start(vec![Scenario::status(status)]);
         let buffer = RingBuffer::new(64 * 1024, 16 * 1024);
         let stop = Arc::new(AtomicBool::new(false));
@@ -333,6 +335,58 @@ fn permanent_status_terminates_reader_with_fatal_flag() {
         stop.store(true, Ordering::SeqCst);
         server.stop();
     }
+}
+
+/// Байтовая граница D1 (design stream-reconnect-retry): 200-ответ,
+/// закрывшийся без единого байта тела, успешным соединением не считается
+/// — отказ следующего соединения фатален, как на первом: сессия ещё не
+/// доказала адрес данными (пин против сдвига точки установки флага).
+#[test]
+fn empty_200_then_status_stays_fatal() {
+    let fixture = common::fixture_bytes();
+    let mut server = MockServer::start(vec![
+        Scenario::stream(Vec::new()),
+        Scenario::status(404),
+        Scenario::stream(fixture[..64 * 1024].to_vec()),
+    ]);
+    let buffer = RingBuffer::new(64 * 1024, 16 * 1024);
+    let stop = Arc::new(AtomicBool::new(false));
+    let budget = GarbageBudget::shared();
+    let link = Link::shared();
+    let net_status = net::SharedNetStatus::default();
+
+    let now_playing = sevfm::icy::SharedNowPlaying::default();
+    let reader = net::spawn_reader(
+        server.url(),
+        buffer,
+        stop.clone(),
+        budget,
+        link.clone(),
+        net_status,
+        now_playing,
+        sevfm::icy::SharedEtherGate::default(),
+    )
+    .expect("поток reader'а запускается в тесте");
+
+    // Пустое тело → EOF → backoff → 404 следующего соединения: фатал,
+    // третий сценарий (живой поток) не запрашивается.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !reader.is_finished() {
+        assert!(
+            Instant::now() < deadline,
+            "reader не завершился после пустого 200 и HTTP 404 за 5 с"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    reader.join().expect("reader завершился без паники");
+    assert!(
+        link.fatal(),
+        "отказ соединения до доставившего данные — фатален"
+    );
+    assert_eq!(server.connections(), 2, "третий сценарий не запрашивался");
+
+    stop.store(true, Ordering::SeqCst);
+    server.stop();
 }
 
 /// Повторяемые статусы (HTTP 408/429, design D4
@@ -387,6 +441,107 @@ fn retryable_status_reconnects_and_streams() {
         // reader может стоять в buffer.write на condvar полного буфера —
         // закрытие будит писателя ошибкой Closed, reader завершается
         // детерминированно, без гонки с дедлайном наблюдателя.
+        buffer.close();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = reader.join();
+            tx.send(()).expect("наблюдатель жив");
+        });
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("остановка срабатывает и после статусного ретрая");
+
+        server.stop();
+    }
+}
+
+/// Отказ сервера на переподключении (HTTP 403, 404 и 301, design D1/D2
+/// stream-reconnect-retry): после доставившего данные соединения сессии
+/// статус отклонения транзиентен — фатальный флаг не поднимается, reader
+/// идёт на повторный backoff-ретрай, поток третьего соединения доигрывает
+/// после восстановления. 404 — мотивирующий пример proposal (временно
+/// пропавший маунт), все коды сходятся в общий transient-путь.
+#[test]
+fn rejected_reconnect_retries_and_streams() {
+    for status in [403, 404, 301] {
+        let fixture = common::fixture_bytes();
+        let first = fixture[..32 * 1024].to_vec();
+        let rest = fixture[32 * 1024..64 * 1024].to_vec();
+        let mut server = MockServer::start(vec![
+            Scenario::stream(first.clone()),
+            Scenario::status(status),
+            // Третье соединение после отказа: данные и удержание — новых
+            // переподключений нет, пока тест не закончит.
+            Scenario::paced_then_hold(rest.clone(), 8 * 1024, Duration::from_millis(5)),
+        ]);
+
+        let buffer = RingBuffer::new(64 * 1024, 16 * 1024);
+        let stop = Arc::new(AtomicBool::new(false));
+        let budget = GarbageBudget::shared();
+        let link = Link::shared();
+        let net_status = net::SharedNetStatus::default();
+
+        let now_playing = sevfm::icy::SharedNowPlaying::default();
+        let reader = net::spawn_reader(
+            server.url(),
+            buffer.clone(),
+            stop.clone(),
+            budget,
+            link.clone(),
+            net_status,
+            now_playing,
+            sevfm::icy::SharedEtherGate::default(),
+        )
+        .expect("поток reader'а запускается в тесте");
+
+        // Первое соединение вычитано целиком: сессия доказала адрес
+        // (had_connection), обрыв после 32 КиБ — штатное переподключение.
+        let mut head = vec![0u8; first.len()];
+        let mut filled = 0usize;
+        while filled < head.len() {
+            match buffer.read(&mut head[filled..], Duration::from_secs(5)) {
+                Ok(n) => filled += n,
+                Err(ReadError::Timeout) => panic!("данные первого соединения не дошли за 5 с"),
+                Err(ReadError::Closed) => panic!("буфер закрыт раньше времени"),
+            }
+        }
+        assert_eq!(head, first);
+
+        // Отказ на втором соединении не убивает reader: третья попытка
+        // приносит данные (1 с + 2 с backoff — дедлайн с запасом).
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while server.connections() < 3 || buffer.available() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "HTTP {status}: восстановления нет (соединений {})",
+                server.connections()
+            );
+            assert!(
+                !link.fatal(),
+                "HTTP {status} на переподключении не поднимает фатальный флаг"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!link.fatal(), "HTTP {status} — повторяемый отказ");
+        assert!(!reader.is_finished(), "reader жив и продолжает работу");
+
+        // Поток третьего соединения доигрывает после восстановления.
+        let mut tail = vec![0u8; rest.len()];
+        let mut got = 0usize;
+        while got < tail.len() {
+            match buffer.read(&mut tail[got..], Duration::from_secs(5)) {
+                Ok(n) => got += n,
+                Err(ReadError::Timeout) => panic!("данные третьего соединения не дошли за 5 с"),
+                Err(ReadError::Closed) => panic!("буфер закрыт раньше времени"),
+            }
+        }
+        assert_eq!(tail, rest, "поток восстановлен после отказа");
+        assert_eq!(server.connections(), 3, "ровно два переподключения");
+
+        stop.store(true, Ordering::SeqCst);
+        // Соединение удерживается сценарием: reader в ожидании чтения.
+        // Закрытие буфера будит писателя ошибкой Closed, если он стоит в
+        // buffer.write — teardown детерминирован, без гонки с дедлайном
+        // наблюдателя (паттерн `retryable_status_reconnects_and_streams`).
         buffer.close();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {

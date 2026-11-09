@@ -311,8 +311,10 @@ fn live_loop(
             );
         }
         if link.fatal() {
-            // Сервер отклонил запрос перманентно (HTTP 3xx/4xx): reader
-            // завершился, повторные попытки бессмысленны.
+            // Сервер отклонил запрос перманентно (HTTP 3xx/4xx кроме
+            // 408/429) до доставившего данные соединения сессии
+            // (design D1 stream-reconnect-retry): reader завершился,
+            // повторные попытки бессмысленны.
             return SessionOutcome::Fatal("подключение отклонено сервером".into());
         }
         std::thread::sleep(POLL_INTERVAL);
