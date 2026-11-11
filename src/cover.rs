@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Обложки трека (фаза add-album-art): поиск по цепочке публичных
-//! сервисов без ключа — iTunes → Deezer → Яндекс.Музыка (схема и
-//! эндпоинты — Java-референс, design D1), дисковый кеш повторных
-//! треков и фоновый воркер-поток, не мешающий тракту и окну.
+//! Обложки трека (фазы add-album-art и add-discogs-cover-source):
+//! поиск по цепочке публичных сервисов — Discogs (каталог винила,
+//! необязательный токен пользователя из окружения) → iTunes → Deezer →
+//! Яндекс.Музыка, дисковый кеш повторных треков и фоновый воркер-поток,
+//! не мешающий тракту и окну.
 //!
 //! Сервисы возвращают списки кандидатов — берётся первый с непустым
 //! ключом обложки (верх ранжирования сервиса); поиск Яндекса нестрогий
@@ -62,6 +63,14 @@ const SEARCH_BODY_LIMIT_BYTES: u64 = 1024 * 1024;
 const IMAGE_BODY_LIMIT_BYTES: u64 = 10 * 1024 * 1024;
 /// User-Agent запросов к сервисам обложек (design D3).
 const USER_AGENT: &str = concat!("sevfm/", env!("CARGO_PKG_VERSION"));
+/// Переменная окружения с токеном API Discogs (design D4): непустое
+/// значение — авторизация запросов к Discogs, отсутствующая или пустая —
+/// анонимный доступ. Секрет не встраивается в приложение и не логируется.
+const DISCOGS_TOKEN_ENV: &str = "SEVFM_DISCOGS_TOKEN";
+/// Хост API Discogs (design D2): URL релиза из недоверенного ответа
+/// поиска догружается только на родном API — токен не уходит на чужие
+/// хосты (находка security-ревью).
+const DISCOGS_API_HOST: &str = "api.discogs.com";
 /// Возраст осиротевшего временного файла кеша, после которого он
 /// точно мусор (подчистка на старте воркера — находка ревью).
 const STALE_TEMP_AGE: Duration = Duration::from_secs(3600);
@@ -90,42 +99,76 @@ enum CoverError {
     BadResponse(String),
 }
 
+impl CoverError {
+    /// Контекст шага с сохранением таксономии (находка hunter-ревью):
+    /// «шаг релиза Discogs: HTTP 404» отличает сбой второго запроса
+    /// от недоступности сервиса, не смешивая ветки лога.
+    fn with_context(self, context: &str) -> Self {
+        match self {
+            Self::Network(message) => Self::Network(format!("{context}: {message}")),
+            Self::BadResponse(message) => Self::BadResponse(format!("{context}: {message}")),
+        }
+    }
+}
+
 /// Транспорт HTTP сервисов обложек (design D3): `get_text` — поисковые
 /// ответы, `get_bytes` — картинка. Лимит тела передаёт вызывающий
 /// (design D1 harden-network-resilience): политика «сколько готовы
-/// прочитать» живёт у потребителя, транспорт только исполняет.
+/// прочитать» живёт у потребителя, транспорт только исполняет. `auth` —
+/// готовое значение заголовка Authorization (design D3
+/// add-discogs-cover-source): его составляет сервис (`auth_header`),
+/// картинкам оно не нужно — там всегда `None`.
 /// Трейт существует ради fake-транспорта в юнит-тестах; продакшн —
 /// [`UreqCovers`].
 trait CoverHttp: Send {
     /// Поисковый ответ как текст; тело читается с тем же лимитом.
-    fn get_text(&self, url: &str, limit_bytes: u64) -> Result<String, CoverError> {
-        let bytes = self.get_bytes(url, limit_bytes)?;
+    fn get_text(
+        &self,
+        url: &str,
+        limit_bytes: u64,
+        auth: Option<&str>,
+    ) -> Result<String, CoverError> {
+        let bytes = self.get_bytes(url, limit_bytes, auth)?;
         // Ответы каталогов — UTF-8; не-UTF-8 байты не роняют поиск.
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
-    fn get_bytes(&self, url: &str, limit_bytes: u64) -> Result<Vec<u8>, CoverError>;
+    fn get_bytes(
+        &self,
+        url: &str,
+        limit_bytes: u64,
+        auth: Option<&str>,
+    ) -> Result<Vec<u8>, CoverError>;
 }
 
 /// Сервис цепочки поиска (design D1): эндпоинт, путь к обложке в ответе
 /// и апгрейд размера — всё про один каталог.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Service {
+    Discogs,
     Itunes,
     Deezer,
     Yandex,
 }
 
-/// Порядок цепочки (спека album-art): iTunes — основной каталог,
-/// Deezer — второй эшелон, Яндекс с fuzzy-поиском — последний для
-/// отличий в написании (Deezer часть русскоязычного каталога скрывает
-/// гео-фильтром — живой квирк 2026-11-02, работу для этой станции
-/// делает Яндекс).
-const CHAIN: [Service; 3] = [Service::Itunes, Service::Deezer, Service::Yandex];
+/// Порядок цепочки (спека album-art): Discogs — каталог винила,
+/// закрывающий советскую дискографию, которую стриминговые каталоги
+/// покрывают фрагментарно (неверные матчи на песнях «Мелодии»);
+/// iTunes — основной стриминговый каталог, Deezer — второй эшелон,
+/// Яндекс с fuzzy-поиском — последний для отличий в написании (Deezer
+/// часть русскоязычного каталога скрывает гео-фильтром — живой квирк
+/// 2026-11-02, работу для этой станции делает Яндекс).
+const CHAIN: [Service; 4] = [
+    Service::Discogs,
+    Service::Itunes,
+    Service::Deezer,
+    Service::Yandex,
+];
 
 impl Service {
     /// Имя для лога.
     fn name(self) -> &'static str {
         match self {
+            Service::Discogs => "Discogs",
             Service::Itunes => "iTunes",
             Service::Deezer => "Deezer",
             Service::Yandex => "Яндекс.Музыка",
@@ -133,11 +176,16 @@ impl Service {
     }
 
     /// URL поиска по паре исполнитель + название (design D1). Пробел —
-    /// `+` у iTunes и `%20` у Deezer/Яндекса: эти двое надёжнее понимают
-    /// `%20`; `page=0` у Яндекса обязателен — без него HTTP 400.
+    /// `+` у iTunes и `%20` у остальных: они надёжнее понимают `%20`;
+    /// `page=0` у Яндекса обязателен — без него HTTP 400; Discogs —
+    /// только общий `q=`-поиск: параметрический `artist=`/`release_title=`
+    /// с кириллицей даёт 0 результатов (живая проверка 2026-11-11).
     fn search_url(self, artist: &str, title: &str) -> String {
         let term = utf8_percent_encode(&format!("{artist} {title}"), NON_ALPHANUMERIC).to_string();
         match self {
+            Service::Discogs => {
+                format!("https://api.discogs.com/database/search?q={term}&type=release&per_page=5")
+            }
             Service::Itunes => format!(
                 "https://itunes.apple.com/search?term={}&entity=song&limit=5",
                 term.replace("%20", "+")
@@ -152,7 +200,9 @@ impl Service {
     /// Обложка из ответа поиска: первый кандидат списка с непустым
     /// ключом обложки — верх ранжирования сервиса. Пустой список или
     /// отсутствующая ветка — промах (`None`), не ошибка; мусор вместо
-    /// JSON — ошибка сервиса.
+    /// JSON — ошибка сервиса. У Discogs ключ — `resource_url` релиза:
+    /// обложка в ответе поиска пустая, второй запрос делает
+    /// [`Service::resolve`].
     fn extract_cover(self, body: &str) -> Result<Option<String>, CoverError> {
         let json: Value = serde_json::from_str(body)
             .map_err(|e| CoverError::BadResponse(format!("ответ не JSON: {e}")))?;
@@ -160,6 +210,7 @@ impl Service {
         // `result.tracks.results` — схема неофициального API менялась
         // (`tracks.items` более нет), сам `coverUri` не изменился.
         let candidates = match self {
+            Service::Discogs => json.get("results"),
             Service::Itunes => json.get("results"),
             Service::Deezer => json.get("data"),
             Service::Yandex => json
@@ -172,12 +223,13 @@ impl Service {
         };
         for item in candidates {
             // Deezer прячет обложку в album.cover_big; iTunes и Яндекс
-            // держат ключ на самом кандидате.
+            // держат ключ на самом кандидате; Discogs — URL релиза.
             let holder = match self {
                 Service::Deezer => item.get("album"),
                 _ => Some(item),
             };
             let key = match self {
+                Service::Discogs => "resource_url",
                 Service::Itunes => "artworkUrl100",
                 Service::Deezer => "cover_big",
                 Service::Yandex => "coverUri",
@@ -195,8 +247,11 @@ impl Service {
 
     /// Апгрейд размера картинки в URL (design D1): сервисы отдают
     /// поисковые миниатюры, заменой сегмента получается большой размер.
+    /// Discogs — тождество: размер зашит в подписанном Imgix-URL,
+    /// клиентская подмена параметров ломает подпись (design D5).
     fn upgrade(self, url: &str) -> String {
         match self {
+            Service::Discogs => url.to_owned(),
             Service::Itunes => url.replace("100x100bb", "600x600bb"),
             Service::Deezer => url.replace("/500x500-", "/1000x1000-"),
             // coverUri приходит без схемы, с плейсхолдером размера %%.
@@ -209,6 +264,7 @@ impl Service {
     /// можно только с родных CDN сервиса; чужой хост — промах сервиса.
     fn image_host_suffixes(self) -> &'static [&'static str] {
         match self {
+            Service::Discogs => &["i.discogs.com"],
             Service::Itunes => &["mzstatic.com"],
             Service::Deezer => &["dzcdn.net"],
             Service::Yandex => &["avatars.yandex.net"],
@@ -220,20 +276,112 @@ impl Service {
     /// `mzstatic.com.evil.ru` не проходят); двойная защита к
     /// `https_only` агента.
     fn trusts_image_url(self, url: &str) -> bool {
-        let Ok(uri) = url.parse::<Uri>() else {
-            return false;
-        };
-        uri.scheme_str() == Some("https")
-            && uri.host().is_some_and(|host| {
-                // DNS нечувствителен к регистру и хвостовой FQDN-точке —
-                // сравнение тоже, иначе честный ответ CDN в верхнем
-                // регистре молча терял бы обложку (находка ревью).
-                let host = host.trim_end_matches('.').to_ascii_lowercase();
-                self.image_host_suffixes()
-                    .iter()
-                    .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
-            })
+        trusted_host(url, self.image_host_suffixes())
     }
+
+    /// Значение заголовка Authorization для запросов к API сервиса
+    /// (design D4 add-discogs-cover-source): токен пользователя относится
+    /// только к Discogs (`Discogs token=…`), остальные сервисы без
+    /// ключей. Пустой токен — анонимный доступ (спека: пустая переменная
+    /// трактуется как отсутствие токена). None — запрос анонимный.
+    fn auth_header(self, token: Option<&str>) -> Option<String> {
+        let token = token.filter(|token| !token.is_empty());
+        match self {
+            Service::Discogs => token.map(|token| format!("Discogs token={token}")),
+            _ => None,
+        }
+    }
+
+    /// Обложка сервиса по паре исполнитель + название (design D2
+    /// add-discogs-cover-source): дефолт — один поисковый запрос;
+    /// Discogs двухшаговый — обложка в ответе поиска пустая, по URL
+    /// релиза из `extract_cover` догружается `/releases/{id}` и берётся
+    /// первая картинка типа `primary`.
+    fn resolve(
+        self,
+        http: &dyn CoverHttp,
+        artist: &str,
+        title: &str,
+        token: Option<&str>,
+    ) -> Result<Option<String>, CoverError> {
+        let auth = self.auth_header(token);
+        let body = http.get_text(
+            &self.search_url(artist, title),
+            SEARCH_BODY_LIMIT_BYTES,
+            auth.as_deref(),
+        )?;
+        match self {
+            Service::Discogs => {
+                let Some(release_url) = self.extract_cover(&body)? else {
+                    return Ok(None);
+                };
+                // URL релиза — из недоверенного ответа поиска, а к
+                // запросу прицепляется токен пользователя (находка
+                // security-ревью): догружаем только родной API, чужой
+                // хост — промах сервиса без запроса (симметрия
+                // `trusts_image_url`).
+                if !trusted_host(&release_url, &[DISCOGS_API_HOST]) {
+                    say(&format!(
+                        "сервис обложек {}: URL релиза отклонён ({}) — пропущен",
+                        self.name(),
+                        image_reject_reason(&release_url)
+                    ));
+                    return Ok(None);
+                }
+                let release = http
+                    .get_text(&release_url, SEARCH_BODY_LIMIT_BYTES, auth.as_deref())
+                    // Сбой второго шага различается в логе: 404 удалённого
+                    // релиза при живом поисковом индексе — штатный случай
+                    // (находка hunter-ревью), не «сервис недоступен».
+                    .map_err(|e| e.with_context("шаг релиза Discogs"))?;
+                discogs_release_cover(&release)
+            }
+            _ => self.extract_cover(&body),
+        }
+    }
+}
+
+/// Сегментная проверка «https + хост из списка» (design D3): общая для
+/// allowlist картинок (`trusts_image_url`) и родного API Discogs
+/// (`resolve`). DNS нечувствителен к регистру и хвостовой FQDN-точке —
+/// сравнение тоже, иначе честный ответ CDN в верхнем регистре молча
+/// терял бы обложку (находка ревью).
+fn trusted_host(url: &str, suffixes: &[&str]) -> bool {
+    let Ok(uri) = url.parse::<Uri>() else {
+        return false;
+    };
+    uri.scheme_str() == Some("https")
+        && uri.host().is_some_and(|host| {
+            let host = host.trim_end_matches('.').to_ascii_lowercase();
+            suffixes
+                .iter()
+                .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
+        })
+}
+
+/// Первая картинка типа `primary` из ответа `/releases/{id}` (design D2):
+/// поле `uri` — полный размер, не `uri150` (подписанный Imgix-URL несёт
+/// параметры размера в себе, апгрейд невозможен — design D5). Непустой
+/// `uri` — часть предиката выбора: битая первая primary не топит
+/// следующую (находка hunter-ревью).
+fn discogs_release_cover(body: &str) -> Result<Option<String>, CoverError> {
+    let json: Value = serde_json::from_str(body)
+        .map_err(|e| CoverError::BadResponse(format!("ответ не JSON: {e}")))?;
+    let Some(images) = json.get("images").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    Ok(images
+        .iter()
+        .find(|image| {
+            image.get("type").and_then(Value::as_str) == Some("primary")
+                && image
+                    .get("uri")
+                    .and_then(Value::as_str)
+                    .is_some_and(|url| !url.is_empty())
+        })
+        .and_then(|image| image.get("uri"))
+        .and_then(Value::as_str)
+        .map(str::to_owned))
 }
 
 /// Причина недоверия к URL картинки для лога (design D3, находка
@@ -303,11 +451,17 @@ fn read_limited(reader: impl Read, limit_bytes: u64) -> Result<Vec<u8>, CoverErr
 }
 
 impl CoverHttp for UreqCovers {
-    fn get_bytes(&self, url: &str, limit_bytes: u64) -> Result<Vec<u8>, CoverError> {
-        let response = self
-            .agent
-            .get(url)
-            .header("User-Agent", USER_AGENT)
+    fn get_bytes(
+        &self,
+        url: &str,
+        limit_bytes: u64,
+        auth: Option<&str>,
+    ) -> Result<Vec<u8>, CoverError> {
+        let mut request = self.agent.get(url).header("User-Agent", USER_AGENT);
+        if let Some(auth) = auth {
+            request = request.header("Authorization", auth);
+        }
+        let response = request
             .call()
             .map_err(|e| CoverError::Network(e.to_string()))?;
         let status = response.status().as_u16();
@@ -651,12 +805,15 @@ pub fn clear_cover_cache() -> (u32, u64, u32) {
 /// Цепочка поиска (спека album-art): сервисы по порядку, первый
 /// непустой URL побеждает; сбой сервиса — лог и следующий; полный
 /// промах — `None`.
-fn search_cover(http: &dyn CoverHttp, artist: &str, title: &str) -> Option<(Service, String)> {
+fn search_cover(
+    http: &dyn CoverHttp,
+    artist: &str,
+    title: &str,
+    token: Option<&str>,
+) -> Option<(Service, String)> {
     for service in CHAIN {
-        let url = service.search_url(artist, title);
-        let outcome = http
-            .get_text(&url, SEARCH_BODY_LIMIT_BYTES)
-            .and_then(|body| service.extract_cover(&body))
+        let outcome = service
+            .resolve(http, artist, title, token)
             .map(|cover| match cover {
                 // URL картинки — из недоверенного ответа: загрузка только
                 // с родного CDN сервиса (design D3), иначе промах сервиса
@@ -683,6 +840,9 @@ fn search_cover(http: &dyn CoverHttp, artist: &str, title: &str) -> Option<(Serv
                     "сервис обложек {} недоступен: {e}",
                     service.name()
                 ));
+                if let Some(hint) = discogs_auth_hint(service, &e, token) {
+                    say(&hint);
+                }
             }
             Err(e @ CoverError::BadResponse(_)) => {
                 say(&format!(
@@ -695,6 +855,19 @@ fn search_cover(http: &dyn CoverHttp, artist: &str, title: &str) -> Option<(Serv
     None
 }
 
+/// Подсказка про токен (design D7 add-discogs-cover-source): API Discogs
+/// отклонил запрос без токена (HTTP 401/403 — отзыв анонимного доступа)
+/// — диагностика самодостаточна. Значение токена в лог не попадает.
+fn discogs_auth_hint(service: Service, error: &CoverError, token: Option<&str>) -> Option<String> {
+    let CoverError::Network(message) = error else {
+        return None;
+    };
+    let rejected = message.contains("HTTP 401") || message.contains("HTTP 403");
+    (service == Service::Discogs && token.is_none() && rejected).then(|| {
+        format!("сервис обложек Discogs: отклонён анонимный доступ — задайте {DISCOGS_TOKEN_ENV}")
+    })
+}
+
 /// Одна загрузка обложки трека: кеш → цепочка → скачивание → декод →
 /// кеш. Все исходы логируются (задача 4.2), внешне — `Found` или `Miss`.
 /// `growth` — прирост кеша с прошлой проверки лимита: после записи
@@ -705,6 +878,7 @@ fn load_cover(
     http: &dyn CoverHttp,
     artist: &str,
     title: &str,
+    token: Option<&str>,
     growth: &mut CacheGrowth,
 ) -> CoverReply {
     if let Some(dir) = cache
@@ -713,14 +887,14 @@ fn load_cover(
         say(&format!("обложка: кеш — {artist} — {title}"));
         return CoverReply::Found(image);
     }
-    let Some((service, cover_url)) = search_cover(http, artist, title) else {
+    let Some((service, cover_url)) = search_cover(http, artist, title, token) else {
         say(&format!(
             "обложка не найдена ({}): {artist} — {title}",
             chain_names()
         ));
         return CoverReply::Miss;
     };
-    let bytes = match http.get_bytes(&cover_url, IMAGE_BODY_LIMIT_BYTES) {
+    let bytes = match http.get_bytes(&cover_url, IMAGE_BODY_LIMIT_BYTES, None) {
         Ok(bytes) => bytes,
         Err(e) => {
             say(&format!(
@@ -793,13 +967,32 @@ pub struct Covers {
 
 impl Covers {
     /// Продакшн-сервис: ureq-транспорт и кеш в пользовательском каталоге.
+    /// Токен Discogs (design D4) читается из окружения один раз при
+    /// старте; в логе — только факт, значение токена не логируется.
     pub fn start() -> Self {
-        Self::with_backend(cache_dir(), Box::new(UreqCovers::new()))
+        let token = std::env::var(DISCOGS_TOKEN_ENV)
+            .ok()
+            .filter(|token| !token.is_empty());
+        match token.as_deref() {
+            Some(_) => say(&format!(
+                "сервис обложек Discogs: используется токен из {DISCOGS_TOKEN_ENV}"
+            )),
+            None => say("сервис обложек Discogs: анонимный доступ"),
+        }
+        Self::with_backend(cache_dir(), Box::new(UreqCovers::new()), token)
     }
 
-    /// Сборка с заданным транспортом и каталогом кеша (`None` — без
-    /// кеша): для fake-транспорта юнит-тестов.
-    fn with_backend(cache: Option<PathBuf>, http: Box<dyn CoverHttp>) -> Self {
+    /// Сборка с заданным транспортом, каталогом кеша (`None` — без
+    /// кеша) и токеном Discogs (`None`/пустая строка — анонимно): для
+    /// fake-транспорта юнит-тестов. Пустой токен нормализуется здесь —
+    /// единая точка: и заголовок, и подсказка при отказе анонимного
+    /// доступа видят одно значение (находка hunter-ревью).
+    fn with_backend(
+        cache: Option<PathBuf>,
+        http: Box<dyn CoverHttp>,
+        token: Option<String>,
+    ) -> Self {
+        let token = token.filter(|token| !token.is_empty());
         let (request_tx, request_rx) = channel::<Request>();
         let (reply_tx, reply_rx) = channel::<Reply>();
         let generation = Arc::new(AtomicU64::new(0));
@@ -814,7 +1007,7 @@ impl Covers {
             .name("cover-service".into())
             .spawn(move || {
                 if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
-                    worker_loop(cache, http, request_rx, reply_tx)
+                    worker_loop(cache, http, token, request_rx, reply_tx)
                 })) {
                     let message = payload
                         .downcast_ref::<&str>()
@@ -908,6 +1101,7 @@ impl Covers {
 fn worker_loop(
     cache: Option<PathBuf>,
     http: Box<dyn CoverHttp>,
+    token: Option<String>,
     requests: Receiver<Request>,
     replies: Sender<Reply>,
 ) {
@@ -920,6 +1114,7 @@ fn worker_loop(
     }
     // Прирост кеша с прошлой проверки лимита (design D3).
     let mut growth = CacheGrowth::production();
+    let token = token.as_deref();
     while let Ok(mut current) = requests.recv() {
         while let Ok(next) = requests.try_recv() {
             current = next;
@@ -929,6 +1124,7 @@ fn worker_loop(
             http.as_ref(),
             &current.artist,
             &current.title,
+            token,
             &mut growth,
         );
         let _ = replies.send(Reply {
@@ -952,9 +1148,10 @@ mod tests {
     struct FakeHttp {
         texts: Vec<(&'static str, Result<String, String>, u64)>,
         bytes: Vec<(&'static str, Result<Vec<u8>, String>)>,
-        /// Каждое обращение — URL и переданный лимит тела: тесты политики
-        /// лимитов (design D1) сверяют лимиты поиска и картинки.
-        calls: Arc<Mutex<Vec<(String, u64)>>>,
+        /// Каждое обращение — URL, лимит тела и наличие заголовка
+        /// Authorization: тесты политики лимитов (design D1) и токена
+        /// (design D4 add-discogs-cover-source) сверяют их.
+        calls: Arc<Mutex<Vec<(String, u64, bool)>>>,
     }
 
     impl FakeHttp {
@@ -980,12 +1177,21 @@ mod tests {
                 .lock()
                 .expect("замок вызовов не отравлен")
                 .iter()
-                .filter(|(url, _)| url.contains(needle))
+                .filter(|(url, _, _)| url.contains(needle))
                 .count()
         }
 
         fn calls_total(&self) -> usize {
             self.calls.lock().expect("замок вызовов не отравлен").len()
+        }
+
+        /// Был ли хоть один вызов по URL с заголовком Authorization.
+        fn had_auth(&self, needle: &str) -> bool {
+            self.calls
+                .lock()
+                .expect("замок вызовов не отравлен")
+                .iter()
+                .any(|(url, _, auth)| *auth && url.contains(needle))
         }
 
         /// Лимиты всех обращений по порядку — поиск/картинка.
@@ -994,17 +1200,23 @@ mod tests {
                 .lock()
                 .expect("замок вызовов не отравлен")
                 .iter()
-                .map(|(_, limit)| *limit)
+                .map(|(_, limit, _)| *limit)
                 .collect()
         }
     }
 
     impl CoverHttp for FakeHttp {
-        fn get_text(&self, url: &str, limit_bytes: u64) -> Result<String, CoverError> {
-            self.calls
-                .lock()
-                .expect("замок вызовов не отравлен")
-                .push((url.to_owned(), limit_bytes));
+        fn get_text(
+            &self,
+            url: &str,
+            limit_bytes: u64,
+            auth: Option<&str>,
+        ) -> Result<String, CoverError> {
+            self.calls.lock().expect("замок вызовов не отравлен").push((
+                url.to_owned(),
+                limit_bytes,
+                auth.is_some(),
+            ));
             let (_, outcome, delay_ms) = self
                 .texts
                 .iter()
@@ -1016,11 +1228,17 @@ mod tests {
             outcome.clone().map_err(CoverError::Network)
         }
 
-        fn get_bytes(&self, url: &str, limit_bytes: u64) -> Result<Vec<u8>, CoverError> {
-            self.calls
-                .lock()
-                .expect("замок вызовов не отравлен")
-                .push((url.to_owned(), limit_bytes));
+        fn get_bytes(
+            &self,
+            url: &str,
+            limit_bytes: u64,
+            auth: Option<&str>,
+        ) -> Result<Vec<u8>, CoverError> {
+            self.calls.lock().expect("замок вызовов не отравлен").push((
+                url.to_owned(),
+                limit_bytes,
+                auth.is_some(),
+            ));
             self.bytes
                 .iter()
                 .find(|(needle, _)| url.contains(needle))
@@ -1088,28 +1306,42 @@ mod tests {
         );
     }
 
-    /// Поиск и картинка получают свои лимиты тела (design D1): fake
-    /// фиксирует лимит каждого обращения.
+    /// Лимит тела (design D1 harden-network-resilience): fake
+    /// фиксирует лимит каждого обращения — поиск и картинка получают
+    /// свои лимиты, оба шага Discogs проходят под поисковым.
     #[test]
     fn search_and_image_use_their_body_limits() {
         let mut http = FakeHttp::default();
+        // Discogs двухшаговый: и поиск, и релиз читаются поисковым
+        // лимитом, картинка — своим (находка hunter-ревью: стаб должен
+        // доводить поток до релиза, иначе лимит второго шага не
+        // проверяется).
         http.text(
-            "itunes.apple.com/search",
-            r#"{"results":[{"artworkUrl100":"https://is1-ssl.mzstatic.com/x/100x100bb.jpg"}]}"#,
+            "api.discogs.com/database/search",
+            r#"{"results":[{"resource_url":"https://api.discogs.com/releases/7"}]}"#,
         );
-        http.jpeg("mzstatic");
+        http.text(
+            "api.discogs.com/releases/7",
+            r#"{"images":[{"type":"primary","uri":"https://i.discogs.com/p7"}]}"#,
+        );
+        http.jpeg("i.discogs.com/p7");
         let reply = load_cover(
             None,
             &http,
             "Артист",
             "Трек",
+            None,
             &mut CacheGrowth::production(),
         );
         assert!(matches!(reply, CoverReply::Found(_)), "{reply:?}");
         assert_eq!(
             http.limits_snapshot(),
-            vec![SEARCH_BODY_LIMIT_BYTES, IMAGE_BODY_LIMIT_BYTES],
-            "поиск — свой лимит, картинка — свой"
+            vec![
+                SEARCH_BODY_LIMIT_BYTES,
+                SEARCH_BODY_LIMIT_BYTES,
+                IMAGE_BODY_LIMIT_BYTES
+            ],
+            "оба шага Discogs — поисковый лимит, картинка — свой"
         );
     }
 
@@ -1119,6 +1351,16 @@ mod tests {
     #[test]
     fn image_host_allowlist_is_segmental() {
         let cases = [
+            (
+                Service::Discogs,
+                "https://i.discogs.com/sig/rs:fit/q:90/x.jpeg",
+                true,
+            ),
+            (
+                Service::Discogs,
+                "https://i.discogs.com.evil.ru/x.jpg",
+                false,
+            ),
             (
                 Service::Itunes,
                 "https://is1-ssl.mzstatic.com/image/600x600bb.jpg",
@@ -1143,6 +1385,7 @@ mod tests {
                 "https://e-cdns-images.dzcdn.net/x.jpg",
                 false,
             ),
+            (Service::Itunes, "https://i.discogs.com/x.jpg", false),
             // Регистр и хвостовая FQDN-точка — DNS нечувствительна к ним,
             // сравнение тоже (находка ревью: честный ответ в верхнем
             // регистре молча терял бы обложку).
@@ -1168,6 +1411,7 @@ mod tests {
     #[test]
     fn untrusted_image_url_falls_through_to_next_service() {
         let mut http = FakeHttp::default();
+        http.text("api.discogs.com", r#"{"results":[]}"#);
         http.text(
             "itunes.apple.com/search",
             r#"{"results":[{"artworkUrl100":"https://evil.example.com/x/100x100bb.jpg"}]}"#,
@@ -1182,6 +1426,7 @@ mod tests {
             &http,
             "Артист",
             "Трек",
+            None,
             &mut CacheGrowth::production(),
         );
         assert!(matches!(reply, CoverReply::Found(_)), "{reply:?}");
@@ -1199,6 +1444,15 @@ mod tests {
     /// `+` у iTunes и `%20` у остальных, параметры по схеме design D1.
     #[test]
     fn search_urls_encode_cyrillic_terms() {
+        let discogs = Service::Discogs.search_url("Иосиф Кобзон", "Катюша");
+        assert!(
+            discogs.starts_with("https://api.discogs.com/database/search?q="),
+            "{discogs}"
+        );
+        assert!(discogs.ends_with("&type=release&per_page=5"), "{discogs}");
+        assert!(discogs.contains("%20"), "пробел — %20: {discogs}");
+        assert!(!discogs.contains('+'), "{discogs}");
+
         let itunes = Service::Itunes.search_url("Владимир Трошин", "Юность моя");
         assert!(
             itunes.starts_with("https://itunes.apple.com/search?term="),
@@ -1226,7 +1480,7 @@ mod tests {
         assert!(!yandex.contains('+'), "{yandex}");
 
         // Кириллица нигде не осталась сырой.
-        for url in [&itunes, &deezer, &yandex] {
+        for url in [&discogs, &itunes, &deezer, &yandex] {
             assert!(
                 !url.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c)),
                 "кириллица закодирована: {url}"
@@ -1236,9 +1490,49 @@ mod tests {
 
     /// Разбор ответов (задача 1.3): первый кандидат с непустым ключом,
     /// апгрейд размеров, вложенность Deezer (album.cover_big), пустые
-    /// и отсутствующие списки — промах, мусор — ошибка сервиса.
+    /// и отсутствующие списки — промах, мусор — ошибка сервиса. Discogs:
+    /// поиск отдаёт URL релиза (второй шаг — `resolve`), релиз — первую
+    /// картинку `primary`.
     #[test]
     fn extract_takes_first_candidate_and_upgrades_size() {
+        // Discogs: поиск возвращает URL релиза первого кандидата, без
+        // апгрейда (подписанный Imgix-URL не параметризуем — design D5).
+        let discogs = r#"{"results":[{"id":1},{"id":2,"resource_url":"https://api.discogs.com/releases/2"}]}"#;
+        assert_eq!(
+            Service::Discogs.extract_cover(discogs).unwrap(),
+            Some("https://api.discogs.com/releases/2".to_owned())
+        );
+
+        // Релиз Discogs: первая картинка типа primary, не secondary и
+        // не uri150.
+        let release = r#"{"images":[
+            {"type":"secondary","uri":"https://i.discogs.com/s"},
+            {"type":"primary","uri":"https://i.discogs.com/p"}]}"#;
+        assert_eq!(
+            discogs_release_cover(release).unwrap(),
+            Some("https://i.discogs.com/p".to_owned())
+        );
+        // Первая primary без uri не топит следующую (находка
+        // hunter-ревью).
+        let broken_first = r#"{"images":[
+            {"type":"primary","uri":""},
+            {"type":"primary","uri":"https://i.discogs.com/p2"}]}"#;
+        assert_eq!(
+            discogs_release_cover(broken_first).unwrap(),
+            Some("https://i.discogs.com/p2".to_owned())
+        );
+        // Пустые/отсутствующие ветки релиза — промах, мусор — ошибка.
+        assert_eq!(discogs_release_cover(r#"{"images":[]}"#).unwrap(), None);
+        assert_eq!(
+            discogs_release_cover(
+                r#"{"images":[{"type":"secondary","uri":"https://i.discogs.com/s"}]}"#
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(discogs_release_cover("{}").unwrap(), None);
+        assert!(discogs_release_cover("<html>").is_err());
+
         // iTunes: кандидат без artworkUrl100 пропускается, размер
         // повышается.
         let itunes = r#"{"resultCount":2,"results":[{"artistId":1},{"artworkUrl100":"https://x/100x100bb.jpg"}]}"#;
@@ -1269,6 +1563,8 @@ mod tests {
 
         // Пустые списки и отсутствующие ветки — промах, не ошибка.
         for (service, body) in [
+            (Service::Discogs, r#"{"results":[]}"#),
+            (Service::Discogs, "{}"),
             (Service::Itunes, r#"{"resultCount":0,"results":[]}"#),
             (Service::Deezer, r#"{"data":[]}"#),
             (Service::Deezer, "{}"),
@@ -1299,69 +1595,248 @@ mod tests {
     }
 
     /// Цепочка (задача 2.2): первый непустой результат побеждает и
-    /// остальные не опрашиваются; сбой и мусор сервиса не прерывают
-    /// цепочку; промах всех — None.
+    /// остальные не опрашиваются; двухшаговый Discogs делает ровно два
+    /// запроса; сбой и мусор сервиса не прерывают цепочку; промах
+    /// всех — None.
     #[test]
     fn chain_first_hit_wins_and_failures_continue() {
-        // Находка первым сервисом: Deezer и Яндекс не опрашиваются.
-        // Хост картинки — родной CDN (design D3): allowlist пропускает.
+        // Находка первым сервисом: Discogs двухшаговый — поиск отдаёт
+        // URL релиза, релиз — картинку с родного CDN (design D2);
+        // остальные не опрашиваются.
         let mut http = FakeHttp::default();
         http.text(
-            "itunes.apple.com",
-            r#"{"results":[{"artworkUrl100":"https://is1-ssl.mzstatic.com/a/100x100bb.jpg"}]}"#,
+            "api.discogs.com/database/search",
+            r#"{"results":[{"id":7,"resource_url":"https://api.discogs.com/releases/7"}]}"#,
         );
-        http.jpeg("mzstatic.com/a/");
-        let (service, url) = search_cover(&http, "Владимир", "Юность").expect("iTunes находит");
+        http.text(
+            "api.discogs.com/releases/7",
+            r#"{"images":[{"type":"primary","uri":"https://i.discogs.com/p7"}]}"#,
+        );
+        let (service, url) = search_cover(&http, "Иосиф", "Катюша", None).expect("Discogs находит");
         assert_eq!(
             (service, url.as_str()),
-            (
-                Service::Itunes,
-                "https://is1-ssl.mzstatic.com/a/600x600bb.jpg"
-            )
+            (Service::Discogs, "https://i.discogs.com/p7")
         );
+        assert_eq!(http.calls_of("api.discogs.com"), 2, "поиск и релиз");
+        assert_eq!(http.calls_of("itunes"), 0, "iTunes не опрашивается");
         assert_eq!(http.calls_of("deezer"), 0, "Deezer не опрашивается");
         assert_eq!(http.calls_of("yandex"), 0, "Яндекс не опрашивается");
 
-        // Сбой сети iTunes → находка Deezer, Яндекс не тронут.
+        // Сбой сети Discogs → находка iTunes, хвостовые не тронуты.
         let mut http = FakeHttp::default();
-        http.text_err("itunes.apple.com", "сеть недоступна");
+        http.text_err("api.discogs.com", "сеть недоступна");
         http.text(
-            "api.deezer.com",
-            r#"{"data":[{"album":{"cover_big":"https://e-cdns-images.dzcdn.net/d/500x500-1.jpg"}}]}"#,
+            "itunes.apple.com",
+            r#"{"results":[{"artworkUrl100":"https://is1-ssl.mzstatic.com/d/100x100bb.jpg"}]}"#,
         );
-        let (service, _) = search_cover(&http, "Владимир", "Юность").expect("Deezer добирает");
-        assert_eq!(service, Service::Deezer);
+        let (service, _) =
+            search_cover(&http, "Владимир", "Юность", None).expect("iTunes добирает");
+        assert_eq!(service, Service::Itunes);
+        assert_eq!(http.calls_of("deezer"), 0, "Deezer не опрашивается");
         assert_eq!(http.calls_of("yandex"), 0, "Яндекс не опрашивается");
 
-        // Мусорный JSON iTunes и промах Deezer → находка Яндексом.
+        // Мусорный JSON Discogs, промах iTunes и промах Deezer →
+        // находка Яндексом.
         let mut http = FakeHttp::default();
-        http.text("itunes.apple.com", "<html>");
+        http.text("api.discogs.com", "<html>");
+        http.text("itunes.apple.com", r#"{"results":[]}"#);
         http.text("api.deezer.com", r#"{"data":[]}"#);
         http.text(
             "api.music.yandex.net",
             r#"{"result":{"tracks":{"results":[{"coverUri":"avatars.yandex.net/y%%"}]}}}"#,
         );
-        let (service, url) = search_cover(&http, "Владимир", "Юность").expect("Яндекс добирает");
+        let (service, url) =
+            search_cover(&http, "Владимир", "Юность", None).expect("Яндекс добирает");
         assert_eq!(
             (service, url.as_str()),
             (Service::Yandex, "https://avatars.yandex.net/y1000x1000")
         );
-        assert_eq!(http.calls_total(), 3, "опрошены все три сервиса");
+        assert_eq!(http.calls_total(), 4, "опрошены все четыре сервиса");
 
         // Промах всех и сбой всех — None.
         let mut http = FakeHttp::default();
-        for needle in ["itunes.apple.com", "api.deezer.com", "api.music.yandex.net"] {
+        for needle in [
+            "api.discogs.com/database/search",
+            "itunes.apple.com",
+            "api.deezer.com",
+            "api.music.yandex.net",
+        ] {
             http.text(needle, "{}");
         }
-        assert_eq!(search_cover(&http, "Владимир", "Юность"), None);
+        assert_eq!(search_cover(&http, "Владимир", "Юность", None), None);
         let mut http = FakeHttp::default();
-        for needle in ["itunes.apple.com", "api.deezer.com", "api.music.yandex.net"] {
+        for needle in [
+            "api.discogs.com/database/search",
+            "itunes.apple.com",
+            "api.deezer.com",
+            "api.music.yandex.net",
+        ] {
             http.text_err(needle, "сеть недоступна");
         }
         assert_eq!(
-            search_cover(&http, "Владимир", "Юность"),
+            search_cover(&http, "Владимир", "Юность", None),
             None,
             "сбой всех сервисов — промах"
+        );
+    }
+
+    /// Токен Discogs (design D4, спека «Необязательный токен»): токен
+    /// идёт заголовком Authorization к API Discogs на обоих шагах;
+    /// остальным сервисам и картинкам заголовок не передаётся; пустой
+    /// токен — анонимный доступ.
+    #[test]
+    fn discogs_token_sent_only_to_discogs_api() {
+        let itunes =
+            r#"{"results":[{"artworkUrl100":"https://is1-ssl.mzstatic.com/a/100x100bb.jpg"}]}"#;
+
+        // Оба шага Discogs с токеном (находка hunter-ревью: релизный шаг
+        // тоже авторизуется).
+        let mut http = FakeHttp::default();
+        http.text(
+            "api.discogs.com/database/search",
+            r#"{"results":[{"resource_url":"https://api.discogs.com/releases/7"}]}"#,
+        );
+        http.text(
+            "api.discogs.com/releases/7",
+            r#"{"images":[{"type":"primary","uri":"https://i.discogs.com/p7"}]}"#,
+        );
+        let (service, _) = search_cover(&http, "Иосиф", "Катюша", Some("секрет"))
+            .expect("Discogs находит с токеном");
+        assert_eq!(service, Service::Discogs);
+        assert!(
+            http.had_auth("api.discogs.com/database/search"),
+            "токен — заголовком к поиску Discogs"
+        );
+        assert!(
+            http.had_auth("api.discogs.com/releases/"),
+            "токен — заголовком и к релизу Discogs"
+        );
+
+        // Токен не покидает API Discogs: промах Discogs → iTunes без
+        // заголовка.
+        let mut http = FakeHttp::default();
+        http.text("api.discogs.com", r#"{"results":[]}"#);
+        http.text("itunes.apple.com", itunes);
+        let (service, _) = search_cover(&http, "Иосиф", "Катюша", Some("секрет"))
+            .expect("после промаха Discogs находит iTunes");
+        assert_eq!(service, Service::Itunes);
+        assert!(
+            !http.had_auth("itunes.apple.com"),
+            "остальным сервисам токен не передаётся"
+        );
+
+        // Пустой токен — анонимно.
+        let mut http = FakeHttp::default();
+        http.text("api.discogs.com", r#"{"results":[]}"#);
+        http.text("itunes.apple.com", itunes);
+        search_cover(&http, "Иосиф", "Катюша", Some(""));
+        assert!(
+            !http.had_auth("api.discogs.com"),
+            "пустой токен трактуется как отсутствие"
+        );
+    }
+
+    /// Подсказка про токен (design D7): только Discogs, только без
+    /// токена, только на HTTP 401/403 — значение токена в тексте
+    /// подсказки не участвует.
+    #[test]
+    fn discogs_auth_hint_on_rejection_without_token() {
+        let rejected = CoverError::Network("HTTP 401".into());
+        let hint = discogs_auth_hint(Service::Discogs, &rejected, None)
+            .expect("отказ анонимного доступа — подсказка");
+        assert!(hint.contains(DISCOGS_TOKEN_ENV), "{hint}");
+
+        assert!(
+            discogs_auth_hint(Service::Discogs, &rejected, Some("секрет")).is_none(),
+            "с токеном подсказки нет"
+        );
+        assert!(
+            discogs_auth_hint(Service::Itunes, &rejected, None).is_none(),
+            "чужой сервис подсказки не даёт"
+        );
+        assert!(
+            discogs_auth_hint(
+                Service::Discogs,
+                &CoverError::Network("HTTP 500".into()),
+                None
+            )
+            .is_none(),
+            "обычный сбой сети — не про токен"
+        );
+        assert!(
+            discogs_auth_hint(
+                Service::Discogs,
+                &CoverError::BadResponse("мусор".into()),
+                None
+            )
+            .is_none(),
+            "мусорный ответ — не про токен"
+        );
+    }
+
+    /// Сбой второго шага Discogs при успешном первом (находка
+    /// hunter-ревью): сетевой сбой релиза, мусор вместо JSON релиза и
+    /// релиз без `images` — все три ветки переводят цепочку к iTunes,
+    /// причина ошибки сохраняется.
+    #[test]
+    fn discogs_second_step_failure_falls_through() {
+        let search_with_release =
+            r#"{"results":[{"resource_url":"https://api.discogs.com/releases/7"}]}"#;
+        let itunes_hit =
+            r#"{"results":[{"artworkUrl100":"https://is1-ssl.mzstatic.com/a/100x100bb.jpg"}]}"#;
+
+        // Релиз недоступен (удалён при живом поисковом индексе).
+        let mut http = FakeHttp::default();
+        http.text("api.discogs.com/database/search", search_with_release);
+        http.text_err("api.discogs.com/releases/7", "HTTP 404");
+        http.text("itunes.apple.com", itunes_hit);
+        let (service, _) = search_cover(&http, "Иосиф", "Катюша", None).expect("iTunes добирает");
+        assert_eq!(service, Service::Itunes, "сбой релиза — цепочка живёт");
+
+        // Мусор вместо JSON релиза.
+        let mut http = FakeHttp::default();
+        http.text("api.discogs.com/database/search", search_with_release);
+        http.text("api.discogs.com/releases/7", "<html>");
+        http.text("itunes.apple.com", itunes_hit);
+        let (service, _) = search_cover(&http, "Иосиф", "Катюша", None).expect("iTunes добирает");
+        assert_eq!(service, Service::Itunes, "мусор релиза — цепочка живёт");
+
+        // Релиз без картинок — промах сервиса, не ошибка.
+        for release_body in [
+            r#"{"images":[]}"#,
+            r#"{"images":[{"type":"secondary","uri":"https://i.discogs.com/s"}]}"#,
+            "{}",
+        ] {
+            let mut http = FakeHttp::default();
+            http.text("api.discogs.com/database/search", search_with_release);
+            http.text("api.discogs.com/releases/7", release_body);
+            http.text("itunes.apple.com", itunes_hit);
+            let (service, _) =
+                search_cover(&http, "Иосиф", "Катюша", None).expect("iTunes добирает");
+            assert_eq!(service, Service::Itunes, "промах релиза: {release_body}");
+        }
+    }
+
+    /// URL релиза на чужом хосте не догружается — токен не уходит с
+    /// api.discogs.com (находка security-ревью), цепочка продолжается.
+    #[test]
+    fn discogs_release_url_on_foreign_host_is_not_fetched() {
+        let mut http = FakeHttp::default();
+        http.text(
+            "api.discogs.com/database/search",
+            r#"{"results":[{"resource_url":"https://evil.example.com/releases/7"}]}"#,
+        );
+        http.text(
+            "itunes.apple.com",
+            r#"{"results":[{"artworkUrl100":"https://is1-ssl.mzstatic.com/a/100x100bb.jpg"}]}"#,
+        );
+        let (service, _) = search_cover(&http, "Иосиф", "Катюша", Some("секрет"))
+            .expect("после отклонения URL релиза находит iTunes");
+        assert_eq!(service, Service::Itunes);
+        assert_eq!(
+            http.calls_of("evil.example.com"),
+            0,
+            "запрос на чужой хост не выполняется — и без токена"
         );
     }
 
@@ -1669,13 +2144,14 @@ mod tests {
         let dir = test_cache_dir("service");
 
         let mut http = FakeHttp::default();
+        http.text("api.discogs.com", r#"{"results":[]}"#);
         http.text(
             "itunes.apple.com",
             r#"{"results":[{"artworkUrl100":"https://is1-ssl.mzstatic.com/a/100x100bb.jpg"}]}"#,
         );
         http.jpeg("mzstatic.com/a/");
         let calls = http.calls.clone();
-        let covers = Covers::with_backend(Some(dir.clone()), Box::new(http));
+        let covers = Covers::with_backend(Some(dir.clone()), Box::new(http), None);
 
         covers.request("hit", "x");
         assert!(matches!(
@@ -1683,7 +2159,10 @@ mod tests {
             CoverReply::Found(_)
         ));
         let after_first = calls.lock().expect("замок вызовов не отравлен").len();
-        assert!(after_first >= 2, "поиск и скачивание сходили в сеть");
+        assert!(
+            after_first >= 3,
+            "поиск Discogs, поиск iTunes и скачивание сходят в сеть"
+        );
 
         covers.request("hit", "x");
         assert!(matches!(
@@ -1717,10 +2196,11 @@ mod tests {
         http.text_slow("term=slow", r#"{"results":[]}"#, 300);
         // Промах первого сервиса проходит цепочку дальше — хвостовые
         // сервисы отвечают пустыми результатами.
+        http.text("api.discogs.com/database/search", r#"{"results":[]}"#);
         http.text("api.deezer.com", r#"{"data":[]}"#);
         http.text("api.music.yandex.net", "{}");
         http.jpeg("mzstatic.com/a/");
-        let covers = Covers::with_backend(None, Box::new(http));
+        let covers = Covers::with_backend(None, Box::new(http), None);
 
         // Штатные запросы-ответы.
         covers.request("hit", "x");
@@ -1775,14 +2255,24 @@ mod tests {
             calls: Arc<Mutex<Vec<String>>>,
         }
         impl CoverHttp for PanicHttp {
-            fn get_text(&self, url: &str, _limit_bytes: u64) -> Result<String, CoverError> {
+            fn get_text(
+                &self,
+                url: &str,
+                _limit_bytes: u64,
+                _auth: Option<&str>,
+            ) -> Result<String, CoverError> {
                 self.calls
                     .lock()
                     .expect("замок вызовов не отравлен")
                     .push(url.to_owned());
                 panic!("транспорт сломан");
             }
-            fn get_bytes(&self, url: &str, _limit_bytes: u64) -> Result<Vec<u8>, CoverError> {
+            fn get_bytes(
+                &self,
+                url: &str,
+                _limit_bytes: u64,
+                _auth: Option<&str>,
+            ) -> Result<Vec<u8>, CoverError> {
                 self.calls
                     .lock()
                     .expect("замок вызовов не отравлен")
@@ -1797,6 +2287,7 @@ mod tests {
             Box::new(PanicHttp {
                 calls: calls.clone(),
             }),
+            None,
         );
 
         covers.track_changed(Some(("Артист", "Трек")));
@@ -1826,7 +2317,7 @@ mod tests {
         let mut http = FakeHttp::default();
         http.text("itunes.apple.com", "{}"); // ни один вызов не ожидается
         let calls = http.calls.clone();
-        let covers = Covers::with_backend(None, Box::new(http));
+        let covers = Covers::with_backend(None, Box::new(http), None);
 
         covers.track_changed(None);
         std::thread::sleep(Duration::from_millis(200));
@@ -1844,11 +2335,11 @@ mod tests {
 
     /// Живые сервисы обложек — реальная сеть, запуск вручную:
     /// `cargo test --lib cover::tests::live -- --ignored --nocapture`.
-    /// Для каждого сервиса: известный трек находится, обложка
-    /// скачивается и декодируется (эндпоинт, кодирование, путь в JSON,
-    /// апгрейд размера, CDN). Плюс цепочка на треках эфира станции —
-    /// победитель или честный промах, включая опечатку в названии для
-    /// fuzzy-добора хвостовыми сервисами.
+    /// Для каждого сервиса: известный трек находится (Discogs — оба
+    /// шага), обложка скачивается и декодируется (эндпоинт, кодирование,
+    /// путь в JSON, апгрейд размера, CDN). Плюс цепочка на треках эфира
+    /// станции — победитель или честный промах, включая опечатку в
+    /// названии для fuzzy-добора хвостовыми сервисами.
     #[test]
     #[ignore = "живая сеть: cargo test --lib cover::tests::live -- --ignored --nocapture"]
     fn live_services_find_download_and_decode() {
@@ -1856,23 +2347,22 @@ mod tests {
         // Известный трек для каждого каталога: у Deezer «Машина
         // времени» скрыта гео-фильтром (total есть, data пуст —
         // живой квирк 2026-11-02), поэтому проверочные треки — из
-        // эфира станции.
+        // эфира станции; у Discogs — релиз «Мелодии», которого нет
+        // у стриминговых каталогов целиком (живая проверка
+        // 2026-11-11: «Кобзон Катюша» — 48 релизов СССР).
         let known = [
+            (Service::Discogs, ("Иосиф Кобзон", "Катюша")),
             (Service::Itunes, ("Владимир Трошин", "ЮНОСТЬ МОЯ")),
             (Service::Deezer, ("Владимир Трошин", "Юность моя")),
             (Service::Yandex, ("Эдуард Хиль", "Я очень рад")),
         ];
         for (service, (artist, title)) in known {
-            let url = service.search_url(artist, title);
-            let body = http
-                .get_text(&url, SEARCH_BODY_LIMIT_BYTES)
-                .expect("поисковый запрос прошёл");
             let cover_url = service
-                .extract_cover(&body)
-                .expect("ответ парсится")
+                .resolve(&http, artist, title, None)
+                .expect("поисковый запрос прошёл и ответ парсится")
                 .unwrap_or_else(|| panic!("{} не нашёл известный трек", service.name()));
             let bytes = http
-                .get_bytes(&cover_url, IMAGE_BODY_LIMIT_BYTES)
+                .get_bytes(&cover_url, IMAGE_BODY_LIMIT_BYTES, None)
                 .expect("обложка скачалась");
             let image = decode_jpeg(&bytes).expect("обложка декодируется");
             println!(
@@ -1892,7 +2382,7 @@ mod tests {
             ),
             ("ЭДУАРД ХИЛЬ", "ДЕВУШКА В САПОЖКАХ"),
         ] {
-            match search_cover(&http, artist, title) {
+            match search_cover(&http, artist, title, None) {
                 Some((service, url)) => {
                     println!("цепочка {artist} — {title}: {} ({url})", service.name());
                 }
@@ -1901,52 +2391,92 @@ mod tests {
         }
     }
 
-    /// Живой добор Яндексом при недоступных iTunes и Deezer: обёртка над
-    /// реальным транспортом возвращает ошибку первым двум сервисам —
-    /// цепочка обязана дойти до настоящего API Яндекса, найти, скачать
-    /// и декодировать обложку. Запуск:
+    /// Реальный транспорт, но запросы к заблокированным сервисам —
+    /// ошибка, как при их недоступности.
+    struct BlockedHttp {
+        real: UreqCovers,
+        blocked: Vec<&'static str>,
+    }
+    impl CoverHttp for BlockedHttp {
+        fn get_text(
+            &self,
+            url: &str,
+            limit_bytes: u64,
+            auth: Option<&str>,
+        ) -> Result<String, CoverError> {
+            if self.blocked.iter().any(|needle| url.contains(needle)) {
+                return Err(CoverError::Network("сервис отключён тестом".into()));
+            }
+            self.real.get_text(url, limit_bytes, auth)
+        }
+
+        fn get_bytes(
+            &self,
+            url: &str,
+            limit_bytes: u64,
+            auth: Option<&str>,
+        ) -> Result<Vec<u8>, CoverError> {
+            if self.blocked.iter().any(|needle| url.contains(needle)) {
+                return Err(CoverError::Network("сервис отключён тестом".into()));
+            }
+            self.real.get_bytes(url, limit_bytes, auth)
+        }
+    }
+
+    /// Живой сбой Discogs — цепочка дходит до iTunes (спека «Сбой
+    /// сервиса не прерывает цепочку» на новой голове цепочки): Discogs
+    /// блокирован тестом, iTunes находит, скачивает и декодирует.
+    /// Запуск:
     /// `cargo test --lib cover::tests::live -- --ignored --nocapture`.
     #[test]
     #[ignore = "живая сеть: cargo test --lib cover::tests::live -- --ignored --nocapture"]
-    fn live_yandex_when_first_two_services_down() {
-        /// Реальный транспорт, но запросы к заблокированным сервисам —
-        /// ошибка, как при их недоступности.
-        struct BlockedHttp {
-            real: UreqCovers,
-            blocked: [&'static str; 2],
-        }
-        impl CoverHttp for BlockedHttp {
-            fn get_text(&self, url: &str, limit_bytes: u64) -> Result<String, CoverError> {
-                if self.blocked.iter().any(|needle| url.contains(needle)) {
-                    return Err(CoverError::Network("сервис отключён тестом".into()));
-                }
-                self.real.get_text(url, limit_bytes)
-            }
-
-            fn get_bytes(&self, url: &str, limit_bytes: u64) -> Result<Vec<u8>, CoverError> {
-                if self.blocked.iter().any(|needle| url.contains(needle)) {
-                    return Err(CoverError::Network("сервис отключён тестом".into()));
-                }
-                self.real.get_bytes(url, limit_bytes)
-            }
-        }
-
+    fn live_itunes_when_discogs_blocked() {
         let http = BlockedHttp {
             real: UreqCovers::new(),
-            blocked: ["itunes.apple.com", "api.deezer.com"],
+            blocked: vec!["api.discogs.com"],
+        };
+        let reply = load_cover(
+            None,
+            &http,
+            "Владимир Трошин",
+            "ЮНОСТЬ МОЯ",
+            None,
+            &mut CacheGrowth::production(),
+        );
+        let CoverReply::Found(image) = reply else {
+            panic!("iTunes не добрал обложку при заблокированном Discogs");
+        };
+        println!(
+            "добор iTunes при заблокированном Discogs: {}x{}",
+            image.width, image.height
+        );
+    }
+
+    /// Живой добор Яндексом при недоступных Discogs, iTunes и Deezer:
+    /// обёртка над реальным транспортом возвращает ошибку первым трём
+    /// сервисам — цепочка обязана дойти до настоящего API Яндекса,
+    /// найти, скачать и декодировать обложку. Запуск:
+    /// `cargo test --lib cover::tests::live -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "живая сеть: cargo test --lib cover::tests::live -- --ignored --nocapture"]
+    fn live_yandex_when_first_three_services_down() {
+        let http = BlockedHttp {
+            real: UreqCovers::new(),
+            blocked: vec!["api.discogs.com", "itunes.apple.com", "api.deezer.com"],
         };
         let reply = load_cover(
             None,
             &http,
             "Эдуард Хиль",
             "Я очень рад",
+            None,
             &mut CacheGrowth::production(),
         );
         let CoverReply::Found(image) = reply else {
-            panic!("Яндекс не добрал обложку при недоступных iTunes и Deezer");
+            panic!("Яндекс не добрал обложку при недоступных первых трёх сервисах");
         };
         println!(
-            "добор Яндексом при лежащих iTunes и Deezer: {}x{}",
+            "добор Яндексом при лежащих Discogs, iTunes и Deezer: {}x{}",
             image.width, image.height
         );
     }
