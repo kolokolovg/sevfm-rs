@@ -188,7 +188,11 @@ fn command_play(binding: &SharedUiBinding, window: &PlayerWindow) {
             // Обложка тоже: гасим незавершённый поиск прошлой
             // сессии и показываем заглушку до первого трека.
             ui.covers.invalidate();
+            // Источник гасим вместе с обложкой (design D6
+            // add-cover-source-watermark): иначе плашка прошлой сессии
+            // «залипла» бы на заглушке до первого трека.
             window.set_cover(placeholder_cover);
+            window.set_cover_source("".into());
         }
         Err(e) => {
             // Поля прошлой сессии не переживают неудачный старт:
@@ -199,7 +203,10 @@ fn command_play(binding: &SharedUiBinding, window: &PlayerWindow) {
             window.set_track_title("".into());
             window.set_error(format!("не удалось запустить поток чтения: {e}").into());
             ui.covers.invalidate();
+            // Источник — вместе с обложкой (design D6
+            // add-cover-source-watermark).
             window.set_cover(placeholder_cover);
+            window.set_cover_source("".into());
         }
     }
 }
@@ -642,7 +649,11 @@ fn run_ui(binding: &SharedUiBinding, process_stop: &Arc<AtomicBool>) -> i32 {
     // Старт в «Остановлено» — уже с заглушкой (спека player-ui): у
     // свойства `cover` дефолта больше нет.
     let placeholder_cover = window.get_placeholder_cover();
+    // Источник гасим вместе с первой заглушкой (design D6
+    // add-cover-source-watermark): дефолт свойства пуст, но связку
+    // держим рядом с `set_cover`, чтобы обе точки не разъехались.
     window.set_cover(placeholder_cover.clone());
+    window.set_cover_source("".into());
 
     // Трей (design D1/D3 add-tray): единая иконка приложения, меню —
     // декларативно в .slint, бэкенд строит Slint. Отказ — только лог:
@@ -801,14 +812,20 @@ fn run_ui(binding: &SharedUiBinding, process_stop: &Arc<AtomicBool>) -> i32 {
                         // предыдущего трека не должна задерживаться на
                         // окне (находка ревью P1).
                         if ui.covers.is_dead() {
+                            // Источник — вместе с заглушкой (design D6
+                            // add-cover-source-watermark).
                             window.set_cover(placeholder_cover.clone());
+                            window.set_cover_source("".into());
                         } else {
                             ui.covers.track_changed(Some((artist, title)));
                         }
                     }
                     _ => {
                         ui.covers.track_changed(None);
+                        // Источник — вместе с заглушкой (design D6
+                        // add-cover-source-watermark).
                         window.set_cover(placeholder_cover.clone());
+                        window.set_cover_source("".into());
                     }
                 }
                 // Трек-строка (правило чек-листа 4.3): трек — исполнитель
@@ -831,10 +848,40 @@ fn run_ui(binding: &SharedUiBinding, process_stop: &Arc<AtomicBool>) -> i32 {
             // внутри сервиса, поэтому каждый доставленный применим;
             // промах — заглушка (спека album-art).
             while let Some(reply) = ui.covers.poll_reply() {
-                window.set_cover(match reply {
-                    CoverReply::Found(image) => slint_cover(&image),
-                    CoverReply::Miss => placeholder_cover.clone(),
-                });
+                // Источник ставится строго вместе с обложкой (design D6
+                // add-cover-source-watermark): иначе при смене трека
+                // плашка «мигнула» бы именем прошлого источника поверх
+                // новой обложки (спека player-ui «Смена трека»).
+                match reply {
+                    CoverReply::Found(image) => {
+                        // Инвариант пары (design D6
+                        // add-cover-source-watermark, спека player-ui
+                        // «Смена трека»): обложка и источник ставятся в
+                        // одном кадре таймера, без выхода в цикл событий
+                        // между записями; при рефакторинге пару не
+                        // разрывать — старая плашка поверх новой
+                        // обложки и есть «мигнувшее» имя прошлого
+                        // источника. Источник — первым: если между
+                        // записями встанет промежуточный кадр,
+                        // безопаснее свежая плашка над старой обложкой,
+                        // чем устаревшее имя поверх новой.
+                        // None — обложка без источника (старый кеш,
+                        // повреждённый sidecar): пустая строка гасит
+                        // плашку, не ошибка.
+                        window.set_cover_source(
+                            image
+                                .source
+                                .map(|service| service.name())
+                                .unwrap_or_default()
+                                .into(),
+                        );
+                        window.set_cover(slint_cover(&image));
+                    }
+                    CoverReply::Miss => {
+                        window.set_cover(placeholder_cover.clone());
+                        window.set_cover_source("".into());
+                    }
+                }
             }
             if let Some(status) = update.status {
                 window.set_status(status.label().into());

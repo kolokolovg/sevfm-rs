@@ -84,6 +84,12 @@ const CACHE_LIMIT_BYTES: u64 = 100 * 1024 * 1024;
 /// скан каталога не чаще раза в день прослушивания, миллисекунды в
 /// потоке воркера, без таймеров и дополнительных потоков.
 const CACHE_RECHECK_DELTA_BYTES: u64 = 8 * 1024 * 1024;
+/// Предел размера sidecar источника (design D2
+/// add-cover-source-watermark): там лежит одно машинное имя — считанные
+/// байты, 32 Б с запасом. Больший файл — не наша запись: подброшенный
+/// гигант или `<key>.src → /dev/zero` не должен вешать воркера
+/// бесконечным чтением (находка security-ревью).
+const SIDECAR_LIMIT_BYTES: u64 = 32;
 
 /// Ошибка обращения к сервису обложек. Варианты разделяют формулировки
 /// лога (находка ревью): «недоступен» уводил бы диагностику мусорного
@@ -141,9 +147,11 @@ trait CoverHttp: Send {
 }
 
 /// Сервис цепочки поиска (design D1): эндпоинт, путь к обложке в ответе
-/// и апгрейд размера — всё про один каталог.
+/// и апгрейд размера — всё про один каталог. Публичен с design D1
+/// add-cover-source-watermark: источник обложки доезжает до потребителя
+/// полем [`CoverImage::source`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Service {
+pub enum Service {
     Discogs,
     Itunes,
     Deezer,
@@ -165,13 +173,45 @@ const CHAIN: [Service; 4] = [
 ];
 
 impl Service {
-    /// Имя для лога.
-    fn name(self) -> &'static str {
+    /// Человекочитаемое имя сервиса: в лог и в ватермарк окна (design D4
+    /// add-cover-source-watermark — ватермарк показывает то же имя, что
+    /// и лог, чтобы два списка подписей не разъехались).
+    pub fn name(self) -> &'static str {
         match self {
             Service::Discogs => "Discogs",
             Service::Itunes => "iTunes",
             Service::Deezer => "Deezer",
             Service::Yandex => "Яндекс.Музыка",
+        }
+    }
+
+    /// Стабильное машинное имя (design D2 add-cover-source-watermark):
+    /// содержимое sidecar-файла кеша `<key>.src` и формат
+    /// [`Service::from_machine_name`]. Отдельно от лог-имени [`Service::
+    /// name`]: ASCII без локализации переживает смену формулировок лога,
+    /// а sidecar живёт на диске дольше версии приложения.
+    pub fn machine_name(self) -> &'static str {
+        match self {
+            Service::Discogs => "discogs",
+            Service::Itunes => "itunes",
+            Service::Deezer => "deezer",
+            Service::Yandex => "yandex",
+        }
+    }
+
+    /// Обратное к [`Service::machine_name`] (design D2): разбор sidecar-файла
+    /// кеша. Трим — единственной точкой, здесь: sidecar мог быть переписан
+    /// руками (хвостовой перевод строки от редактора), а размазывать
+    /// подготовку входа по вызывающим — рассадник рассинхрона. Неизвестное
+    /// имя — `None`: обложка без источника, не ошибка (деградация спеки
+    /// album-art).
+    pub fn from_machine_name(name: &str) -> Option<Service> {
+        match name.trim() {
+            "discogs" => Some(Service::Discogs),
+            "itunes" => Some(Service::Itunes),
+            "deezer" => Some(Service::Deezer),
+            "yandex" => Some(Service::Yandex),
+            _ => None,
         }
     }
 
@@ -481,6 +521,14 @@ pub struct CoverImage {
     pub height: u32,
     /// RGB-байты, `width * height * 3` штук.
     pub pixels: Vec<u8>,
+    /// Сервис цепочки — источник обложки (design D1
+    /// add-cover-source-watermark): окно рисует по нему ватермарк.
+    /// Поле, а не новый вариант ответа: источник обязан доезжать и из
+    /// свежего фетча, и из кеш-хита, а паттерны `CoverReply::Found(_)`
+    /// у потребителей не ломаются. `None` — обложка без источника
+    /// (старый кеш, повреждённый sidecar); легален и не влияет на
+    /// поиск и воспроизведение (спека album-art).
+    pub source: Option<Service>,
 }
 
 /// Декод JPEG (design D4): не декодируется — ошибка; мусор не
@@ -503,6 +551,9 @@ fn decode_jpeg(bytes: &[u8]) -> Result<CoverImage, CoverError> {
         width: rgb.width(),
         height: rgb.height(),
         pixels: rgb.into_raw(),
+        // Декодер источник не знает (design D1): его проставляет свежий
+        // фетч (`load_cover`) или sidecar кеша (`read_cached`).
+        source: None,
     })
 }
 
@@ -537,17 +588,44 @@ pub fn cached_cover_path(artist: &str, title: &str) -> Option<std::path::PathBuf
     file.is_file().then_some(file)
 }
 
+/// Источник из sidecar кеша (design D2 add-cover-source-watermark):
+/// читается только обычный файл не больше [`SIDECAR_LIMIT_BYTES`] —
+/// `symlink_metadata` не следует по ссылке (паттерн `touch_last_used`),
+/// подменённый `<key>.src → /dev/zero` или гигантский файл не вешают
+/// воркера на чтение (находка security-ревью). Всё прочее — тихий
+/// `None`: обложка без источника легальна (спека album-art).
+fn sidecar_source(sidecar: &Path) -> Option<Service> {
+    let meta = std::fs::symlink_metadata(sidecar).ok()?;
+    if !meta.is_file() || meta.len() > SIDECAR_LIMIT_BYTES {
+        return None;
+    }
+    std::fs::read_to_string(sidecar)
+        .ok()
+        .and_then(|name| Service::from_machine_name(&name))
+}
+
 /// Обложка из кеша; попадание обновляет время последнего использования
 /// записи (design D1 cover-cache-cleanup) — вытеснение по лимиту удаляет
-/// давно неиспользованные первыми. Повреждённый файл удаляется и
+/// давно неиспользованные первыми. Вместе с jpg читается sidecar
+/// `<key>.src` с источником (design D2 add-cover-source-watermark): нет
+/// файла (кеш старого формата), не обычный файл или больше лимита
+/// (подменённая запись — находка security-ревью), не UTF-8 или
+/// неизвестное имя — обложка без источника, не ошибка и без лога (спека
+/// album-art: показ, поиск и воспроизведение не задеваются).
+/// Повреждённый jpg удаляется вместе со своим sidecar (design D3) и
 /// считается промахом (design D4) — при следующей смене трек поищется
 /// заново.
 fn read_cached(dir: &Path, artist: &str, title: &str) -> Option<CoverImage> {
-    let file = dir.join(cache_key(artist, title) + ".jpg");
+    let key = cache_key(artist, title);
+    let file = dir.join(key.clone() + ".jpg");
+    let sidecar = dir.join(key + ".src");
     let bytes = std::fs::read(&file).ok()?;
     match decode_jpeg(&bytes) {
-        Ok(image) => {
+        Ok(mut image) => {
             touch_last_used(&file);
+            // Источник — часть записи (design D2): читается после
+            // успешного декода jpg, любой сбой деградирует до None.
+            image.source = sidecar_source(&sidecar);
             Some(image)
         }
         Err(e) => {
@@ -556,6 +634,9 @@ fn read_cached(dir: &Path, artist: &str, title: &str) -> Option<CoverImage> {
                 file.display()
             ));
             let _ = std::fs::remove_file(&file);
+            // Sidecar — часть записи (design D3): удаляется вместе с
+            // jpg; отсутствие sidecar (старый кеш) — не событие.
+            let _ = std::fs::remove_file(&sidecar);
             None
         }
     }
@@ -585,10 +666,26 @@ fn touch_last_used(file: &Path) {
 /// обложки, только запись в лог. Временный файл + rename в том же
 /// каталоге — атомарно, обрыв не оставляет половину; суффикс pid —
 /// параллельный экземпляр приложения пишет свой temp (находка ревью),
-/// осироты подчистит старт воркера. Возвращает размер записанных байтов:
-/// воркер копит прирост для повторной проверки лимита (design D3
-/// cover-cache-cleanup); неудача — `None`.
-fn write_cached(dir: &Path, artist: &str, title: &str, bytes: &[u8]) -> Option<u64> {
+/// осироты подчистит старт воркера. Рядом с jpg пишется sidecar
+/// `<key>.src` с машинным именем сервиса (design D2
+/// add-cover-source-watermark) тем же паттерном tmp + rename — его
+/// осиротевший tmp имеет тот же вид `.*.tmp` и подчищается
+/// `sweep_stale_temp_files` без изменения фильтра. Неудача sidecar —
+/// тихий пропуск: jpg-запись остаётся успешной, а обложка без источника
+/// легальна (спека album-art, запись в лог не требуется); сама цель при
+/// неудаче снимается best effort — осиротевший sidecar прежней записи
+/// рядом с новым jpg дал бы ложную атрибуцию источника (находка ревью:
+/// «без источника» честнее, чем неверное имя). Возвращает
+/// размер записанных байтов jpg: воркер копит прирост для повторной
+/// проверки лимита (design D3 cover-cache-cleanup), sidecar в учёт не
+/// входит; неудача — `None`.
+fn write_cached(
+    dir: &Path,
+    artist: &str,
+    title: &str,
+    service: Service,
+    bytes: &[u8],
+) -> Option<u64> {
     let key = cache_key(artist, title);
     let write = || -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
@@ -597,7 +694,23 @@ fn write_cached(dir: &Path, artist: &str, title: &str, bytes: &[u8]) -> Option<u
         std::fs::rename(temp, dir.join(format!("{key}.jpg")))
     };
     match write() {
-        Ok(()) => Some(bytes.len() as u64),
+        Ok(()) => {
+            // Источник — часть записи (design D2): та же атомарность
+            // tmp + rename, что у jpg; пишется следом и не топит
+            // успешную jpg-запись своей неудачей.
+            let source = || -> std::io::Result<()> {
+                let temp = dir.join(format!(".{key}.{}.src.tmp", std::process::id()));
+                std::fs::write(&temp, service.machine_name())?;
+                std::fs::rename(temp, dir.join(format!("{key}.src")))
+            };
+            // Неудача снимает и старую цель: рядом с новым jpg прежний
+            // sidecar атрибутировал бы запись старому источнику
+            // (находка ревью) — «без источника» честнее.
+            if source().is_err() {
+                let _ = std::fs::remove_file(dir.join(format!("{key}.src")));
+            }
+            Some(bytes.len() as u64)
+        }
         Err(e) => {
             say(&format!("не удалось записать кеш обложки: {e}"));
             None
@@ -630,10 +743,29 @@ fn sweep_stale_temp_files(dir: &Path) {
     }
 }
 
+/// Удаление записи кеша целиком: jpg и его sidecar `<key>.src` — пара
+/// (design D3 add-cover-source-watermark), sidecar снимается при любом
+/// исходе jpg-удаления — ветка «уже нет» (jpg снесён параллельным
+/// экземпляром раньше вытеснения) иначе оставила бы осиротевший
+/// источник (находка ревью). Отказ sidecar — тихий: обложка без
+/// источника легальна (спека album-art); возвращается исход
+/// jpg-удаления — счёт байтов и лог ведутся по jpg.
+fn remove_entry_files(jpg: &Path) -> std::io::Result<()> {
+    let jpg_removed = std::fs::remove_file(jpg);
+    let _ = std::fs::remove_file(jpg.with_extension("src"));
+    jpg_removed
+}
+
 /// Вытеснение кеша по лимиту (design D4, спека album-art «Ограничение
 /// кеша обложек»): при суммарном размере записей `*.jpg` сверх лимита
 /// удаляются самые давно использовавшиеся — mtime обновляется попаданием
-/// (`read_cached`), — пока размер не войдёт в лимит. Отказ удаления
+/// (`read_cached`), — пока размер не войдёт в лимит. Вместе с жертвой
+/// удаляется её sidecar `<key>.src` (design D3
+/// add-cover-source-watermark), в том числе когда jpg уже снесён
+/// параллельным экземпляром (`remove_entry_files`): его отсутствие —
+/// не событие, а размер
+/// sidecar в учёт лимита не входит — сбор записей остаётся только по
+/// `*.jpg`, погрешность ≈10 байт ничтожна против лимита. Отказ удаления
 /// отдельного файла — лог и следующая жертва (best effort, как запись
 /// кеша); `*.tmp` не трогаем: свежие могут принадлежать параллельному
 /// экземпляру, осиротевшие убирает `sweep_stale_temp_files`. `limit` —
@@ -679,14 +811,18 @@ fn enforce_cache_limit(dir: &Path, limit: u64) {
         if excess == 0 {
             break;
         }
-        match std::fs::remove_file(path) {
+        // Пара jpg + sidecar уходит одним вызовом (design D3): исход
+        // jpg-удаления различает учёт и лог, sidecar снят в обоих
+        // засчитываемых исходах.
+        match remove_entry_files(path) {
             Ok(()) => {
                 excess = excess.saturating_sub(*len);
                 removed_files += 1;
                 removed_bytes += *len;
             }
             // Уже нет — параллельный экземпляр или удаление повреждённой
-            // записи: цель достигнута, не событие (находка ревью).
+            // записи: цель достигнута, не событие (находка ревью);
+            // осиротевший sidecar снят хелпером.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 excess = excess.saturating_sub(*len);
                 removed_files += 1;
@@ -736,12 +872,13 @@ impl CacheGrowth {
 }
 
 /// Очистка одного каталога кеша — слой [`clear_cover_cache`] ради
-/// тестов без env-переменных: удаляет файлы записей `*.jpg` и
-/// осиротевшие `*.tmp` (симлинки пропускаются — security-ревью), каталог
-/// остаётся. Возвращает (удалено файлов, освобождённые байты, не
-/// удалось удалить): частичная неудача обязана быть видна вызывающему —
-/// тихий успех при несостоявшейся очистке вводит в заблуждение
-/// (находка ревью).
+/// тестов без env-переменных: удаляет файлы записей `*.jpg`, их sidecar
+/// `*.src` (design D3 add-cover-source-watermark) и осиротевшие `*.tmp`
+/// (симлинки пропускаются — security-ревью), каталог остаётся.
+/// Возвращает (удалено файлов, освобождённые байты, не удалось
+/// удалить): частичная неудача обязана быть видна вызывающему — тихий
+/// успех при несостоявшейся очистке вводит в заблуждение (находка
+/// ревью).
 fn clear_cover_cache_in(dir: &Path) -> (u32, u64, u32) {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -766,7 +903,9 @@ fn clear_cover_cache_in(dir: &Path) -> (u32, u64, u32) {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         let cached = meta.is_file()
-            && (name.ends_with(".jpg") || (name.starts_with('.') && name.ends_with(".tmp")));
+            && (name.ends_with(".jpg")
+                || name.ends_with(".src")
+                || (name.starts_with('.') && name.ends_with(".tmp")));
         if !cached {
             continue;
         }
@@ -904,15 +1043,19 @@ fn load_cover(
             return CoverReply::Miss;
         }
     };
-    let image = match decode_jpeg(&bytes) {
+    let mut image = match decode_jpeg(&bytes) {
         Ok(image) => image,
         Err(e) => {
             say(&format!("обложка {} не декодируется: {e}", service.name()));
             return CoverReply::Miss;
         }
     };
+    // Источник доставляется потребителю (design D1
+    // add-cover-source-watermark): свежий фетч знает победителя цепочки,
+    // кеш-хит восстанавливает его из sidecar (`read_cached`).
+    image.source = Some(service);
     if let Some(dir) = cache
-        && let Some(written) = write_cached(dir, artist, title, &bytes)
+        && let Some(written) = write_cached(dir, artist, title, service, &bytes)
         && growth.record(written)
     {
         enforce_cache_limit(dir, CACHE_LIMIT_BYTES);
@@ -1582,6 +1725,41 @@ mod tests {
         assert!(Service::Itunes.extract_cover("<html>").is_err());
     }
 
+    /// Машинные имена сервисов (задача 1.1, design D2
+    /// add-cover-source-watermark): все четыре идут туда-обратно —
+    /// sidecar кеша записывается и разбирается одной константой;
+    /// неизвестное имя (мусор, пустое, чужой регистр) — None без паники.
+    #[test]
+    fn machine_names_roundtrip() {
+        for (service, name) in [
+            (Service::Discogs, "discogs"),
+            (Service::Itunes, "itunes"),
+            (Service::Deezer, "deezer"),
+            (Service::Yandex, "yandex"),
+        ] {
+            assert_eq!(service.machine_name(), name);
+            assert_eq!(
+                Service::from_machine_name(name),
+                Some(service),
+                "машинное имя разбирается обратно: {name}"
+            );
+        }
+        assert_eq!(Service::from_machine_name("junk"), None);
+        assert_eq!(Service::from_machine_name(""), None);
+        assert_eq!(
+            Service::from_machine_name("Discogs"),
+            None,
+            "машинные имена — в нижнем регистре, регистр значим"
+        );
+        // Трим внутри (находка ревью): sidecar из чужих рук с хвостовым
+        // переводом строки разбирается без подготовки вызывающим.
+        assert_eq!(
+            Service::from_machine_name("discogs\n"),
+            Some(Service::Discogs),
+            "хвостовой перевод строки — не мусор"
+        );
+    }
+
     /// Декод JPEG (задача 2.3): настоящий мини-JPEG декодируется с теми
     /// же размерами; мусор — ошибка.
     #[test]
@@ -1856,15 +2034,16 @@ mod tests {
             cache_key("Владимир", "Другая")
         );
 
-        write_cached(&dir, "Владимир", "Юность", &tiny_jpeg());
+        write_cached(&dir, "Владимир", "Юность", Service::Itunes, &tiny_jpeg());
         let cached = read_cached(&dir, "Владимир", "Юность").expect("записанное читается");
         assert_eq!((cached.width, cached.height), (8, 6));
 
-        // В каталоге только итоговый файл — временный переименовался.
+        // В каталоге итоговые файлы записи — временные переименовались:
+        // jpg и sidecar источника (design D2 add-cover-source-watermark).
         let entries = std::fs::read_dir(&dir)
             .expect("каталог кеша читается")
             .count();
-        assert_eq!(entries, 1, "в кеше один файл");
+        assert_eq!(entries, 2, "в кеше jpg и sidecar источника");
 
         // Повреждённый файл — промах и удаление: следующий запрос трека
         // пойдёт в сеть заново.
@@ -1873,6 +2052,213 @@ mod tests {
         assert_eq!(read_cached(&dir, "Владимир", "Юность"), None);
         assert!(!file.exists(), "битый файл удалён");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Свежий фетч несёт источник (задача 1.2, design D1
+    /// add-cover-source-watermark): обложка доходит до потребителя с
+    /// сервисом — победителем цепочки, а не только с пикселями.
+    #[test]
+    fn fresh_fetch_carries_source() {
+        let mut http = FakeHttp::default();
+        http.text("api.discogs.com", r#"{"results":[]}"#);
+        http.text(
+            "itunes.apple.com",
+            r#"{"results":[{"artworkUrl100":"https://is1-ssl.mzstatic.com/a/100x100bb.jpg"}]}"#,
+        );
+        http.jpeg("mzstatic.com/a/");
+        let reply = load_cover(
+            None,
+            &http,
+            "Артист",
+            "Трек",
+            None,
+            &mut CacheGrowth::production(),
+        );
+        let CoverReply::Found(image) = reply else {
+            panic!("обложка найдена: {reply:?}");
+        };
+        assert_eq!(
+            image.source,
+            Some(Service::Itunes),
+            "источник — победитель цепочки"
+        );
+    }
+
+    /// Sidecar источника (задача 2.1, design D2): запись кладёт
+    /// `<key>.src` с машинным именем, чтение восстанавливает `source`.
+    #[test]
+    fn cache_roundtrip_restores_source() {
+        let dir = test_cache_dir("source-roundtrip");
+        write_cached(&dir, "Владимир", "Юность", Service::Deezer, &tiny_jpeg());
+        let sidecar = dir.join(format!("{}.src", cache_key("Владимир", "Юность")));
+        assert_eq!(
+            std::fs::read_to_string(&sidecar)
+                .expect("sidecar записан")
+                .trim(),
+            Service::Deezer.machine_name(),
+            "sidecar хранит машинное имя"
+        );
+
+        let cached = read_cached(&dir, "Владимир", "Юность").expect("запись читается");
+        assert_eq!(
+            cached.source,
+            Some(Service::Deezer),
+            "источник восстановлен из sidecar"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Кеш старого формата (design D2, спека album-art «Запись кеша без
+    /// источника»): jpg есть, `<key>.src` нет — обложка читается без
+    /// источника, без ошибок и без паники.
+    #[test]
+    fn cache_entry_without_sidecar_reads_without_source() {
+        let dir = test_cache_dir("no-sidecar");
+        write_cached(&dir, "Владимир", "Юность", Service::Itunes, &tiny_jpeg());
+        std::fs::remove_file(dir.join(format!("{}.src", cache_key("Владимир", "Юность"))))
+            .expect("sidecar удалён — имитация кеша старой версии");
+
+        let cached = read_cached(&dir, "Владимир", "Юность").expect("jpg читается");
+        assert_eq!(cached.source, None, "нет sidecar — обложка без источника");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Каталог на пути `<key>.src` (находка ревью): rename в каталог
+    /// отказывает — неудача sidecar не топит jpg-запись, чтение даёт
+    /// обложку без источника.
+    #[test]
+    fn sidecar_target_occupied_by_dir_keeps_jpg_success() {
+        let dir = test_cache_dir("sidecar-dir");
+        let key = cache_key("Владимир", "Юность");
+        std::fs::create_dir(dir.join(format!("{key}.src"))).expect("каталог на цели sidecar");
+
+        let jpeg = tiny_jpeg();
+        assert_eq!(
+            write_cached(&dir, "Владимир", "Юность", Service::Itunes, &jpeg),
+            Some(jpeg.len() as u64),
+            "rename sidecar отказал, jpg-запись успешна"
+        );
+        assert!(dir.join(format!("{key}.jpg")).is_file(), "jpg записан");
+        let cached = read_cached(&dir, "Владимир", "Юность").expect("jpg читается");
+        assert_eq!(cached.source, None, "цель-каталог не читается как имя");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Осиротевший sidecar при неудаче перезаписи (находка ревью): рядом
+    /// с новым jpg старое имя атрибутировало бы запись прошлому
+    /// источнику — неудача записи снимает цель, «без источника» честнее.
+    #[test]
+    fn failed_sidecar_write_removes_stale_sidecar() {
+        let dir = test_cache_dir("sidecar-stale");
+        let key = cache_key("Владимир", "Юность");
+        // Прошлая запись оставила sidecar с другим источником.
+        std::fs::write(dir.join(format!("{key}.src")), "deezer").expect("старый sidecar");
+        // Помеха на временном пути (каталог вместо tmp): запись sidecar
+        // падает до rename — снятие цели единственный шанс не оставить
+        // старое имя (имя tmp зафиксировано doc-контрактом write_cached).
+        std::fs::create_dir(dir.join(format!(".{key}.{}.src.tmp", std::process::id())))
+            .expect("каталог на временном пути sidecar");
+
+        let jpeg = tiny_jpeg();
+        assert_eq!(
+            write_cached(&dir, "Владимир", "Юность", Service::Itunes, &jpeg),
+            Some(jpeg.len() as u64),
+            "неудача sidecar не топит jpg-запись"
+        );
+        assert!(
+            !dir.join(format!("{key}.src")).exists(),
+            "осиротевший sidecar снят"
+        );
+        let cached = read_cached(&dir, "Владимир", "Юность").expect("jpg читается");
+        assert_eq!(
+            cached.source, None,
+            "без источника честнее, чем неверное имя"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Повреждённый sidecar (спека album-art «Повреждённый источник»):
+    /// не-UTF-8 байты и неизвестное имя деградируют до обложки без
+    /// источника — не сбой поиска и не сбой кеша.
+    #[test]
+    fn junk_sidecar_reads_without_source() {
+        let dir = test_cache_dir("junk-sidecar");
+        write_cached(&dir, "Владимир", "Юность", Service::Yandex, &tiny_jpeg());
+        let sidecar = dir.join(format!("{}.src", cache_key("Владимир", "Юность")));
+
+        // Не-UTF-8: чтение строки падает — источник теряется тихо.
+        std::fs::write(&sidecar, [0xff, 0xfe, 0xfa]).expect("не-UTF-8 байты");
+        let cached = read_cached(&dir, "Владимир", "Юность").expect("jpg читается");
+        assert_eq!(cached.source, None, "не-UTF-8 sidecar — без источника");
+
+        // Читаемая строка, но не машинное имя ни одного сервиса.
+        std::fs::write(&sidecar, "junk").expect("неизвестное имя");
+        let cached = read_cached(&dir, "Владимир", "Юность").expect("jpg читается");
+        assert_eq!(cached.source, None, "неизвестное имя — без источника");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Симлинк вместо sidecar (находка security-ревью): `<key>.src` —
+    /// ссылка на настоящий файл с валидным именем — чтение не следует
+    /// по ссылке (паттерн `touch_last_used`): подменённая запись не
+    /// читает чужой файл и не атрибутирует источник.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_sidecar_reads_without_source() {
+        let dir = test_cache_dir("sidecar-symlink");
+        write_cached(&dir, "Владимир", "Юность", Service::Discogs, &tiny_jpeg());
+        let sidecar = dir.join(format!("{}.src", cache_key("Владимир", "Юность")));
+        let real = dir.join("real.src");
+        std::fs::write(&real, "discogs").expect("настоящий sidecar");
+        std::fs::remove_file(&sidecar).expect("штатный sidecar снят");
+        std::os::unix::fs::symlink(&real, &sidecar).expect("симлинк на настоящий файл");
+
+        let cached = read_cached(&dir, "Владимир", "Юность").expect("jpg читается");
+        assert_eq!(
+            cached.source, None,
+            "симлинк-sidecar не читается даже на валидное имя"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sidecar больше лимита (находка security-ревью): гигант или
+    /// подброшенный файл не читается вовсе — воркер не вешается, обложка
+    /// без источника.
+    #[test]
+    fn oversized_sidecar_reads_without_source() {
+        let dir = test_cache_dir("sidecar-oversize");
+        write_cached(&dir, "Владимир", "Юность", Service::Itunes, &tiny_jpeg());
+        let sidecar = dir.join(format!("{}.src", cache_key("Владимир", "Юность")));
+        // 33 байта — лимит + 1: валидное имя, раздутое до перебора.
+        std::fs::write(&sidecar, format!("itunes{}", " ".repeat(27)))
+            .expect("переразмерный sidecar");
+
+        let cached = read_cached(&dir, "Владимир", "Юность").expect("jpg читается");
+        assert_eq!(cached.source, None, "sidecar больше лимита не читается");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Повреждённая запись удаляется целиком (задача 2.1, design D3):
+    /// валидный файл, но не JPEG — при чтении удалены и jpg, и sidecar,
+    /// чтение считается промахом.
+    #[test]
+    fn broken_jpeg_entry_removes_jpg_and_sidecar() {
+        let dir = test_cache_dir("broken-entry");
+        write_cached(&dir, "Владимир", "Юность", Service::Discogs, &tiny_jpeg());
+        let jpg = dir.join(format!("{}.jpg", cache_key("Владимир", "Юность")));
+        let sidecar = dir.join(format!("{}.src", cache_key("Владимир", "Юность")));
+        std::fs::write(&jpg, b"valid bytes, but not a JPEG").expect("порча jpg");
+
+        assert_eq!(
+            read_cached(&dir, "Владимир", "Юность"),
+            None,
+            "повреждённая запись — промах"
+        );
+        assert!(
+            !jpg.exists() && !sidecar.exists(),
+            "удалены и jpg, и sidecar"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1985,8 +2371,8 @@ mod tests {
     #[test]
     fn cache_hit_renews_last_used_and_saves_from_eviction() {
         let dir = test_cache_dir("lru");
-        write_cached(&dir, "Владимир", "Юность", &tiny_jpeg());
-        write_cached(&dir, "Анна", "Другая", &tiny_jpeg());
+        write_cached(&dir, "Владимир", "Юность", Service::Itunes, &tiny_jpeg());
+        write_cached(&dir, "Анна", "Другая", Service::Deezer, &tiny_jpeg());
         let a = dir.join(format!("{}.jpg", cache_key("Владимир", "Юность")));
         let b = dir.join(format!("{}.jpg", cache_key("Анна", "Другая")));
         let now = SystemTime::now();
@@ -2031,6 +2417,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Вытеснение затрагивает sidecar (задача 2.2, design D3
+    /// add-cover-source-watermark): две записи, лимит выдавливает
+    /// старейшую — её `<key>.src` удалён вместе с jpg, у живой записи
+    /// sidecar остаётся.
+    #[test]
+    fn eviction_removes_victim_sidecar_only() {
+        let dir = test_cache_dir("evict-sidecar");
+        write_cached(&dir, "Владимир", "Юность", Service::Itunes, &tiny_jpeg());
+        write_cached(&dir, "Анна", "Другая", Service::Deezer, &tiny_jpeg());
+        let fresh = dir.join(format!("{}.jpg", cache_key("Владимир", "Юность")));
+        let fresh_src = dir.join(format!("{}.src", cache_key("Владимир", "Юность")));
+        let stale = dir.join(format!("{}.jpg", cache_key("Анна", "Другая")));
+        let stale_src = dir.join(format!("{}.src", cache_key("Анна", "Другая")));
+        let now = SystemTime::now();
+        set_last_used(&fresh, now);
+        set_last_used(&stale, now - Duration::from_secs(3000));
+
+        // Лимит на одну запись: выдавлена старейшая — вместе со своим
+        // sidecar (размер sidecar в учёт лимита не входит — design D3).
+        let limit = std::fs::metadata(&fresh).expect("метаданные живы").len();
+        enforce_cache_limit(&dir, limit);
+        assert!(
+            !stale.exists() && !stale_src.exists(),
+            "жертва удалена с sidecar"
+        );
+        assert!(
+            fresh.is_file() && fresh_src.is_file(),
+            "живая запись осталась с sidecar"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Снос пары при уже отсутствующем jpg (находка ревью, симметрия
+    /// спеке album-art «Вытеснение по лимиту»): параллельный экземпляр
+    /// снёс jpg раньше вытеснения — ветка «уже нет» через хелпер всё
+    /// равно уводит осиротевший `<key>.src`.
+    #[test]
+    fn remove_entry_files_takes_orphan_sidecar() {
+        let dir = test_cache_dir("orphan-sidecar");
+        let jpg = dir.join("victim.jpg");
+        let sidecar = dir.join("victim.src");
+        std::fs::write(&sidecar, "itunes").expect("sidecar без jpg");
+
+        let removed = remove_entry_files(&jpg);
+        assert!(
+            removed
+                .as_ref()
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+            "jpg отсутствует — исход «уже нет»: {removed:?}"
+        );
+        assert!(!jpg.exists(), "jpg по-прежнему нет");
+        assert!(!sidecar.exists(), "осиротевший sidecar снят");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Порог повторной проверки лимита (design D3) и размер записи
     /// (задача 1.4): прирост копится и срабатывает на границе дельты,
     /// счётчик сбрасывается проверкой; запись возвращает размер,
@@ -2055,8 +2496,10 @@ mod tests {
 
         let dir = test_cache_dir("write-size");
         let jpeg = tiny_jpeg();
+        // Размер sidecar источника в возвращаемый размер не входит
+        // (design D3 add-cover-source-watermark): учёт лимита — по jpg.
         assert_eq!(
-            write_cached(&dir, "Владимир", "Юность", &jpeg),
+            write_cached(&dir, "Владимир", "Юность", Service::Itunes, &jpeg),
             Some(jpeg.len() as u64)
         );
         // Путь каталога занят файлом — create_dir_all падает: None.
@@ -2066,7 +2509,7 @@ mod tests {
         ));
         std::fs::write(&occupied, b"not a dir").expect("файл на месте каталога");
         assert_eq!(
-            write_cached(&occupied, "Владимир", "Юность", &jpeg),
+            write_cached(&occupied, "Владимир", "Юность", Service::Itunes, &jpeg),
             None,
             "неудача записи — None"
         );
@@ -2112,6 +2555,27 @@ mod tests {
         assert_eq!(clear_cover_cache_in(&dir), (0, 0, 0));
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(clear_cover_cache_in(&dir), (0, 0, 0));
+    }
+
+    /// Очистка затрагивает sidecar (задача 2.2, design D3, спека
+    /// album-art «Полная очистка кеша»): `--clear-cache` удаляет и
+    /// обложки, и сохранённые источники; счётчик файлов учитывает оба.
+    #[test]
+    fn clear_cover_cache_in_removes_sources_too() {
+        let dir = test_cache_dir("clear-sidecar");
+        write_cached(&dir, "Владимир", "Юность", Service::Itunes, &tiny_jpeg());
+        write_cached(&dir, "Анна", "Другая", Service::Deezer, &tiny_jpeg());
+        let a_src = dir.join(format!("{}.src", cache_key("Владимир", "Юность")));
+        let b_src = dir.join(format!("{}.src", cache_key("Анна", "Другая")));
+
+        let (files, _bytes, failed) = clear_cover_cache_in(&dir);
+        assert_eq!(files, 4, "две jpg-записи и два sidecar");
+        assert_eq!(failed, 0, "успешная очистка без неудач");
+        assert!(
+            !a_src.exists() && !b_src.exists(),
+            "sidecar удалены вместе с записями"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Неудачи удаления видны вызывающему (находка ревью): read-only
@@ -2479,5 +2943,48 @@ mod tests {
             "добор Яндексом при лежащих Discogs, iTunes и Deezer: {}x{}",
             image.width, image.height
         );
+    }
+
+    /// Живой источник в ответе и кеше (задача 4.1, design D1 и D2
+    /// add-cover-source-watermark): свежий поиск известной пары несёт
+    /// `source` совпавшего сервиса, повторный запрос через новый воркер
+    /// с тем же каталогом кеша восстанавливает тот же источник из
+    /// sidecar. Кеш — во временном каталоге теста, пользовательский не
+    /// затрагивается. Запуск:
+    /// `cargo test --lib cover::tests::live -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "живая сеть: cargo test --lib cover::tests::live -- --ignored --nocapture"]
+    fn live_source_fresh_and_from_cache() {
+        let dir = test_cache_dir("live-source");
+        let http = UreqCovers::new();
+        let reply = load_cover(
+            Some(&dir),
+            &http,
+            "Иосиф Кобзон",
+            "Катюша",
+            None,
+            &mut CacheGrowth::production(),
+        );
+        let CoverReply::Found(image) = reply else {
+            panic!("известный трек не найден свежим поиском");
+        };
+        let fresh = image.source.expect("свежий фетч несёт источник");
+        println!("свежий источник: {}", fresh.name());
+
+        let covers = Covers::with_backend(Some(dir.clone()), Box::new(UreqCovers::new()), None);
+        covers.track_changed(Some(("Иосиф Кобзон", "Катюша")));
+        let CoverReply::Found(cached) = await_reply(&covers, "повторный запрос из кеша")
+        else {
+            panic!("повтор того же трека не обслужен кешем");
+        };
+        let restored = cached
+            .source
+            .expect("кеш-хит восстанавливает источник из sidecar");
+        println!("источник из кеша: {}", restored.name());
+        assert_eq!(
+            restored, fresh,
+            "источник из кеша совпадает с источником свежего фетча"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

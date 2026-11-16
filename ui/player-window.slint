@@ -108,6 +108,12 @@ export component PlayerWindow inherits Window {
     // заглушка из `placeholder-cover`, Rust кладёт её при не-музыке и
     // остановке (правило видимости трек-строки).
     in-out property <image> cover;
+    // Имя сервиса-источника обложки для ватермарка (design D5
+    // add-cover-source-watermark). Пустая строка — обложка без источника
+    // (заглушка, старый кеш): плашки нет. Меняется связкой в main.rs
+    // строго вместе с `cover` — иначе имя прошлого трека «залипло» бы
+    // на чужой обложке (спека player-ui «Ватермарк источника обложки»).
+    in-out property <string> cover-source;
     // Заглушка фона: не-музыка (вставка, сырой StreamTitle), промах
     // поиска и сброс на новой сессии.
     in-out property <image> placeholder-cover: @image-url("cover-placeholder.png");
@@ -165,6 +171,34 @@ export component PlayerWindow inherits Window {
                 height: 100%;
                 source: root.cover;
                 image-fit: ImageFit.cover;
+            }
+
+            // Ватермарк источника (design D5 add-cover-source-watermark,
+            // спека player-ui «Ватермарк источника обложки»): условная
+            // плашка в правом верхнем углу карточки с отступом 8px.
+            // Фон — тот же тёмный тон rgba(11, 13, 19), что у окна и
+            // градиента (единая палитра), полупрозрачный — читаем на
+            // любых обложках, в отличие от голого текста с тенью.
+            // Ширина — от естественной ширины текста: имя сервиса любой
+            // длины. Без явной width элемент в Slint занимает 100%
+            // родителя — плашка растягивалась на всю карточку (находка
+            // ручной приёмки 4.2). Внутренние поля 8px по бокам.
+            if root.cover-source != "": Rectangle {
+                x: parent.width - self.width - 8px;
+                y: 8px;
+                height: 21px;
+                width: chip-text.preferred-width + 16px;
+                border-radius: 8px;
+                background: rgba(11, 13, 19, 0.6);
+
+                chip-text := Text {
+                    x: 8px;
+                    width: parent.width - 16px;
+                    vertical-alignment: center;
+                    color: white;
+                    font-size: 12px;
+                    text: root.cover-source;
+                }
             }
         }
 
