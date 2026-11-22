@@ -4301,7 +4301,7 @@ dependencies = [
 
 [[package]]
 name = "sevfm"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "async-channel",
  "ctrlc",
