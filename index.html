@@ -46,7 +46,7 @@
         <li>Rust · edition 2024</li>
         <li>Apache-2.0</li>
         <li>Linux · Windows</li>
-        <li class="pill-link"><a href="https://github.com/kolokolovg/sevfm-rs/releases">v0.1.8 · релизы</a></li>
+        <li class="pill-link"><a href="https://github.com/kolokolovg/sevfm-rs/releases">v0.1.9 · релизы</a></li>
       </ul>
       <p class="hero-note">Плеер показывает всё, что звучит в эфире: обложку,
         название и текст песни — прямо в окне, без сторонних сайтов и
@@ -54,7 +54,7 @@
         соединение восстанавливается само, и музыка догоняет эфир.</p>
       <div class="cta-row">
         <a class="btn btn-primary" href="https://github.com/kolokolovg/sevfm-rs/releases/latest">
-          Скачать v0.1.8</a>
+          Скачать v0.1.9</a>
         <a class="btn btn-ghost" href="https://github.com/kolokolovg/sevfm-rs">
           Исходники на GitHub</a>
       </div>
@@ -118,6 +118,9 @@
       <article class="card">
         <h3>Обложки и окно-«Герой»</h3>
         <p>Крупная карточка обложки текущего трека и индикатор состояния.
+          Длинные исполнители и названия в трек-строке не обрезаются
+          многоточием — строка плавно прокатывается в пределах поля,
+          помещающаяся стоит по центру.
           Обложки ищет цепочка — Discogs&nbsp;→ iTunes → Deezer →
           Яндекс.Музыка, побеждает первый найденный результат: советские песни
           получают обложки оригинальных пластинок «Мелодии», а в углу карточки — полупрозрачная подпись источника. Локальный кеш с
@@ -237,7 +240,7 @@
         <div><h3>CI и автоматические релизы</h3>
           <p>Формат, линты и тесты на каждый пуш; релизы тегом <code>v*</code>:
             deb для Linux и exe в zip для Windows —
-            <a href="https://github.com/kolokolovg/sevfm-rs/releases">v0.1.0–v0.1.8</a>.</p></div>
+            <a href="https://github.com/kolokolovg/sevfm-rs/releases">v0.1.0–v0.1.9</a>.</p></div>
       </li>
       <li class="tl-item done">
         <span class="tl-badge" aria-hidden="true">✓</span>
@@ -246,6 +249,14 @@
             LrcLib: окно расширяется вдвое, найденные тексты кешируются
             локально; поиск-фолбэк находит дуэты и записи с другим
             написанием артистов.</p></div>
+      </li>
+      <li class="tl-item done">
+        <span class="tl-badge" aria-hidden="true">✓</span>
+        <div><h3>Автопрокатка трек-строки</h3>
+          <p>Длинные исполнители и названия не обрезаются: строка плавно
+            прокатывается туда-обратно в пределах поля, короткие стоят
+            по центру; прокат сам пересчитывается при смене трека и
+            расширении окна.</p></div>
       </li>
     </ul>
     <p class="section-lead">Поведение зафиксировано спецификациями в
@@ -259,9 +270,9 @@
     <h2>Установка и сборка</h2>
     <p class="section-lead">Готовые пакеты — на
       <a href="https://github.com/kolokolovg/sevfm-rs/releases">странице релизов</a>:
-      <code>sevfm_0.1.8_amd64.deb</code> для Linux (собран на Ubuntu&nbsp;24.04,
+      <code>sevfm_0.1.9_amd64.deb</code> для Linux (собран на Ubuntu&nbsp;24.04,
       нужен glibc&nbsp;≥&nbsp;2.39; ярлык и герб появляются в меню приложений)
-      и <code>sevfm-0.1.8-windows-x64.zip</code> с <code>sevfm.exe</code>
+      и <code>sevfm-0.1.9-windows-x64.zip</code> с <code>sevfm.exe</code>
       для Windows. Релизы выпускаются автоматически тегом <code>v*</code>.</p>
     <p class="section-lead">Или соберите из исходников:</p>
     <div class="build-grid">
@@ -313,7 +324,7 @@ cargo test --test sigint_live -- --ignored</code></pre>
 
 <footer class="site-footer">
   <div class="container footer-row">
-    <p><span class="brand-note" aria-hidden="true">♪</span> sevfm v0.1.8 ·
+    <p><span class="brand-note" aria-hidden="true">♪</span> sevfm v0.1.9 ·
       порт <abbr title="оригинальная версия плеера на Java">Java-версии</abbr> ·
       автор — Gleb Kolokolov</p>
     <p class="footer-links">
