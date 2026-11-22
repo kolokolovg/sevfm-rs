@@ -19,6 +19,7 @@
 pub mod buffer;
 pub mod cover;
 pub mod icy;
+pub mod lyrics;
 pub mod mpris;
 pub mod net;
 pub mod pipeline;

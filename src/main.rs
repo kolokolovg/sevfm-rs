@@ -16,7 +16,8 @@
 //! на Rust + Slint.
 //!
 //! По умолчанию открывается окно (кнопки «Играть»/«Стоп», станция,
-//! статус, трек); флаг `--headless` сохраняет CLI-поведение: тракт
+//! статус, трек); кнопка «Т» открывает панель текста песни. Флаг
+//! `--headless` сохраняет CLI-поведение: тракт
 //! сразу, статусы и эфир в stderr. Позиционный аргумент — URL потока
 //! (без него — станция по умолчанию). Остановка: «Стоп»; полный выход
 //! — «Выход» из трея, закрытие окна (без трея), Ctrl+C (SIGINT) или
@@ -36,11 +37,15 @@ use std::time::Duration;
 
 use sevfm::cover::{CoverImage, CoverReply, Covers, clear_cover_cache};
 use sevfm::icy::TrackInfo;
+use sevfm::lyrics::{Lyrics, LyricsReply, clear_lyrics_cache};
 use sevfm::net::{PlaybackStatus, playback_status};
 use sevfm::session::{PlayerSession, SessionHandle, SessionOutcome};
 use sevfm::tray::TraySnapshot;
-use sevfm::ui::{PlayerView, StatusKind as UiStatusKind, TrackSlot, UiState, parse_args};
-use sevfm::{redact_url, say};
+use sevfm::ui::{
+    LyricsSlot, PlayerView, StatusKind as UiStatusKind, TrackSlot, UiState, lyrics_slot_for_track,
+    parse_args,
+};
+use sevfm::{redact_url, sanitize_display, say};
 
 slint::include_modules!();
 
@@ -120,6 +125,12 @@ struct UiBinding {
     /// Сервис обложек (design D5/D6 add-album-art): подписка на смены
     /// трека и сбор ответов — из poll-таймера, инвалидация — на «Играть».
     covers: Covers,
+    /// Сервис текстов (change add-lyrics-panel, design D4): тот же
+    /// каркас подписки, что у обложек.
+    lyrics: Lyrics,
+    /// Панель текста открыта (спека player-ui «Кнопка „Т" текста
+    /// песни»): состояние держит связка — единый владелец данных окна.
+    panel_open: bool,
 }
 
 impl UiBinding {
@@ -130,6 +141,8 @@ impl UiBinding {
             session: None,
             view: PlayerView::new(),
             covers: Covers::start(),
+            lyrics: Lyrics::start(),
+            panel_open: false,
         }
     }
 }
@@ -188,6 +201,15 @@ fn command_play(binding: &SharedUiBinding, window: &PlayerWindow) {
             // Обложка тоже: гасим незавершённый поиск прошлой
             // сессии и показываем заглушку до первого трека.
             ui.covers.invalidate();
+            // Текст — симметрично (change add-lyrics-panel): гасим поиск
+            // и панель прошлой сессии (спека player-ui: остановка
+            // закрывает панель, новый старт без неё).
+            ui.lyrics.invalidate();
+            ui.panel_open = false;
+            window.set_panel_open(false);
+            window.set_can_lyrics(false);
+            window.set_lyrics("".into());
+            window.set_lyrics_source("".into());
             // Источник гасим вместе с обложкой (design D6
             // add-cover-source-watermark): иначе плашка прошлой сессии
             // «залипла» бы на заглушке до первого трека.
@@ -203,12 +225,67 @@ fn command_play(binding: &SharedUiBinding, window: &PlayerWindow) {
             window.set_track_title("".into());
             window.set_error(format!("не удалось запустить поток чтения: {e}").into());
             ui.covers.invalidate();
+            // Текст — вместе с обложкой (change add-lyrics-panel).
+            ui.lyrics.invalidate();
+            ui.panel_open = false;
+            window.set_panel_open(false);
+            window.set_can_lyrics(false);
+            window.set_lyrics("".into());
+            window.set_lyrics_source("".into());
             // Источник — вместе с обложкой (design D6
             // add-cover-source-watermark).
             window.set_cover(placeholder_cover);
             window.set_cover_source("".into());
         }
     }
+}
+
+/// Запись слота текста в окно (change add-lyrics-panel, спека player-ui
+/// «Кнопка „Т" текста песни»): активная кнопка и содержимое — только у
+/// найденного текста; Searching гасит содержимое до результата, Missing
+/// (текста у трека нет) закрывает и панель — иначе открытая пустая
+/// панель с неактивной кнопкой «Т» несводима пользователем (находка
+/// приёмки 5.3: «логично было бы свернуть это окно»).
+fn set_lyrics_view(ui: &mut UiBinding, window: &PlayerWindow, slot: &LyricsSlot) {
+    match slot {
+        LyricsSlot::Found { text, source } => {
+            window.set_can_lyrics(true);
+            // Сетевой текст — через sanitize_display (политика lib.rs,
+            // находка security-ревью): bidi/управляющие символы из ответа
+            // LrcLib не должны переупорядочивать строки панели — симметрия
+            // с тултипом трея и метаданными MPRIS.
+            window.set_lyrics(sanitize_display(text).into_owned().into());
+            // Плашка источника — строго вместе с текстом: иначе при смене
+            // трека имя прошлого источника «залипло» бы (симметрия пары
+            // обложка/источник design D6 add-cover-source-watermark).
+            window.set_lyrics_source(source.clone().unwrap_or_default().into());
+        }
+        LyricsSlot::Searching => {
+            window.set_can_lyrics(false);
+            window.set_lyrics("".into());
+            window.set_lyrics_source("".into());
+        }
+        LyricsSlot::Missing => {
+            window.set_can_lyrics(false);
+            window.set_lyrics("".into());
+            window.set_lyrics_source("".into());
+            if ui.panel_open {
+                ui.panel_open = false;
+                window.set_panel_open(false);
+            }
+        }
+    }
+}
+
+/// Переключение панели текста (спека player-ui «Кнопка „Т" текста
+/// песни»): Slint не зовёт callback выключенной кнопки — гейт can-lyrics
+/// уже отфильтровал; состояние панели держит связка.
+fn command_toggle_panel(binding: &SharedUiBinding, window: &PlayerWindow) {
+    let mut ui = binding
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    ui.panel_open = !ui.panel_open;
+    window.set_panel_open(ui.panel_open);
 }
 
 /// Команда «Стоп» (design D2 add-tray): флаг остановки сессии — воркер
@@ -478,16 +555,24 @@ fn run() -> i32 {
     // и код 2: тихий успех при несостоявшейся очистке вводит в
     // заблуждение (находка ревью).
     if launch.clear_cache {
-        let (files, bytes, failed) = clear_cover_cache();
+        // Оба кеша — обложек и текстов (спека album-art «Ручная очистка
+        // кеша обложек» в редакции add-lyrics-panel): вывод суммарный.
+        let (cover_files, cover_bytes, cover_failed) = clear_cover_cache();
+        let (lyrics_files, lyrics_bytes, lyrics_failed) = clear_lyrics_cache();
+        let (files, bytes, failed) = (
+            cover_files + lyrics_files,
+            cover_bytes + lyrics_bytes,
+            cover_failed + lyrics_failed,
+        );
         if failed > 0 {
             say(&format!(
-                "кеш обложек очищен частично: не удалось удалить {failed} {} (см. журнал)",
+                "кеш очищен частично: не удалось удалить {failed} {} (см. журнал)",
                 plural_files(failed)
             ));
             return EXIT_FAILURE;
         }
         print_line(&format!(
-            "Кеш обложек очищен: {files} {}, освобождено {}",
+            "Кеш очищен (обложки и тексты): {files} {}, освобождено {}",
             plural_files(files),
             format_bytes(bytes)
         ));
@@ -654,6 +739,24 @@ fn run_ui(binding: &SharedUiBinding, process_stop: &Arc<AtomicBool>) -> i32 {
     // держим рядом с `set_cover`, чтобы обе точки не разъехались.
     window.set_cover(placeholder_cover.clone());
     window.set_cover_source("".into());
+    // Текст песни (change add-lyrics-panel): панель закрыта, кнопка и
+    // содержимое пусты до первого трека; ширину кадра задаст само
+    // свойство panel-open в разметке.
+    window.set_panel_open(false);
+    window.set_can_lyrics(false);
+    window.set_lyrics("".into());
+    window.set_lyrics_source("".into());
+    // Версия сборки в заголовке (просьба пользователя при приёмке):
+    // версия пакета, debug-сборка помечена -dev — приёмка не путается
+    // с релизным бинарником.
+    window.set_app_version(
+        if cfg!(debug_assertions) {
+            concat!(env!("CARGO_PKG_VERSION"), "-dev")
+        } else {
+            env!("CARGO_PKG_VERSION")
+        }
+        .into(),
+    );
 
     // Трей (design D1/D3 add-tray): единая иконка приложения, меню —
     // декларативно в .slint, бэкенд строит Slint. Отказ — только лог:
@@ -734,6 +837,16 @@ fn run_ui(binding: &SharedUiBinding, process_stop: &Arc<AtomicBool>) -> i32 {
     {
         let binding = binding.clone();
         window.on_stop(move || command_stop(&binding));
+    }
+    // Кнопка «Т» (change add-lyrics-panel): та же доставка команды в
+    // главный поток, что у «Играть»/«Стоп».
+    {
+        let binding = binding.clone();
+        let weak = window.as_weak();
+        window.on_toggle_panel(move || {
+            let Some(window) = weak.upgrade() else { return };
+            command_toggle_panel(&binding, &window);
+        });
     }
 
     // Poll-таймер (design D3): создаётся в главном потоке (ограничение
@@ -828,6 +941,39 @@ fn run_ui(binding: &SharedUiBinding, process_stop: &Arc<AtomicBool>) -> i32 {
                         window.set_cover_source("".into());
                     }
                 }
+                // Текст песни — по правилу видимости трек-строки (change
+                // add-lyrics-panel): музыкальный трек — поиск, если воркер
+                // жив (мёртвый гасит кнопку сразу — спека lyrics «Отказы
+                // текста не влияют на воспроизведение»); не-музыка —
+                // гашение без сети (спека lyrics «Не-музыка не ищется»).
+                let lyrics_target = match lyrics_slot_for_track(&slot) {
+                    LyricsSlot::Searching if !ui.lyrics.is_dead() => {
+                        let TrackSlot::Track { artist, title } = &slot else {
+                            // Инвариант lyrics_slot_for_track: Searching
+                            // возможен только у Track-слота.
+                            unreachable!("Searching даёт только TrackSlot::Track");
+                        };
+                        ui.lyrics
+                            .track_changed(Some((artist.as_str(), title.as_str())));
+                        LyricsSlot::Searching
+                    }
+                    LyricsSlot::Searching => LyricsSlot::Missing,
+                    LyricsSlot::Missing => {
+                        ui.lyrics.track_changed(None);
+                        LyricsSlot::Missing
+                    }
+                    // Слот текста — исход воркера, lyrics_slot_for_track
+                    // его не возвращает.
+                    LyricsSlot::Found { .. } => unreachable!("lyrics_slot_for_track без Found"),
+                };
+                // Заимствования разведены: emit от ui.view живёт отдельно,
+                // запись в окно берёт &mut ui (панель закрывается на
+                // Missing — спека player-ui «Смена трека при открытой
+                // панели» в редакции приёмки 5.3).
+                let emitted = ui.view.update_lyrics(lyrics_target);
+                if let Some(slot) = emitted {
+                    set_lyrics_view(&mut ui, &window, &slot);
+                }
                 // Трек-строка (правило чек-листа 4.3): трек — исполнитель
                 // и название; сырой StreamTitle — только название;
                 // заглушка — название станции (без станции строка пуста
@@ -883,11 +1029,46 @@ fn run_ui(binding: &SharedUiBinding, process_stop: &Arc<AtomicBool>) -> i32 {
                     }
                 }
             }
+            // Смерть воркера после эмитинга Searching (находка
+            // hunter-ревью): ответ не придёт никогда — гасим слот в этот
+            // же тик, не дожидаясь смены трека; иначе открытая пустая
+            // панель 880px с неактивной кнопкой «Т» несводима (дед-энд,
+            // который D12 закрывал). Найденный текст не трогаем — он уже
+            // доставлен и показан, авария не отменяет показ.
+            if ui.view.lyrics_searching()
+                && ui.lyrics.is_dead()
+                && let Some(slot) = ui.view.update_lyrics(LyricsSlot::Missing)
+            {
+                set_lyrics_view(&mut ui, &window, &slot);
+            }
+            // Ответы воркера текстов (change add-lyrics-panel):
+            // устаревшие гасятся генерацией внутри сервиса, каждый
+            // доставленный применим.
+            while let Some(reply) = ui.lyrics.poll_reply() {
+                let slot = match reply {
+                    LyricsReply::Found { text, source } => LyricsSlot::Found {
+                        text,
+                        source: source.map(|service| service.name().to_owned()),
+                    },
+                    LyricsReply::Missing => LyricsSlot::Missing,
+                };
+                let emitted = ui.view.update_lyrics(slot);
+                if let Some(slot) = emitted {
+                    set_lyrics_view(&mut ui, &window, &slot);
+                }
+            }
             if let Some(status) = update.status {
                 window.set_status(status.label().into());
                 window.set_status_kind(window_status_kind(status.kind()));
                 window.set_can_play(status == UiState::Stopped);
                 window.set_can_stop(status != UiState::Stopped);
+                // Остановка (в том числе фатальная) закрывает панель
+                // текста (спека player-ui «Остановка закрывает панель»);
+                // окно сжимается по изменению panel-open в разметке.
+                if status == UiState::Stopped && ui.panel_open {
+                    ui.panel_open = false;
+                    window.set_panel_open(false);
+                }
                 // Исход сессии — в stderr: ошибки в окне мимолётны, а
                 // таймлайн Играть/Стоп/ошибка нужен и в логе.
                 if status == UiState::Stopped

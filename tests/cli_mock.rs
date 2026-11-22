@@ -207,6 +207,12 @@ fn clear_cache_removes_covers_and_exits_zero() {
     std::fs::write(covers.join("aaa.jpg"), vec![0u8; 4096]).expect("запись обложки");
     std::fs::write(covers.join("bbb.jpg"), vec![0u8; 8192]).expect("запись обложки");
     std::fs::write(covers.join(".orphan.tmp"), vec![0u8; 10]).expect("осиротевший tmp");
+    // Кеш текстов (change add-lyrics-panel): запись + sidecar очищаются
+    // тем же флагом (спека album-art «Кеш текстов очищен»).
+    let lyrics = base.join("sevfm").join("lyrics");
+    std::fs::create_dir_all(&lyrics).expect("каталог кеша текстов создаётся");
+    std::fs::write(lyrics.join("ccc.txt"), vec![0u8; 2048]).expect("запись текста");
+    std::fs::write(lyrics.join("ccc.src"), b"lrclib").expect("sidecar текста");
 
     // Живой кеш: код 0, файлы удалены, каталог остался, объём в stdout.
     let output = Command::new(env!("CARGO_BIN_EXE_sevfm"))
@@ -218,18 +224,24 @@ fn clear_cache_removes_covers_and_exits_zero() {
         .expect("бинарник sevfm собран");
     assert_eq!(output.status.code(), Some(0), "очистка — код 0");
     let stdout = String::from_utf8_lossy(&output.stdout);
+    // Спека album-art «Ручная очистка кеша обложек» в редакции
+    // add-lyrics-panel: флаг чистит оба кеша, вывод суммарный.
     assert!(
-        stdout.contains("Кеш обложек очищен") && stdout.contains("освобождено"),
+        stdout.contains("Кеш очищен (обложки и тексты)") && stdout.contains("освобождено"),
         "результат в stdout: {stdout}"
     );
     assert!(
-        stdout.contains("3 файла"),
-        "счётчик файлов с формой множественного: {stdout}"
+        stdout.contains("5 файлов"),
+        "счётчик файлов обоих кешей с формой множественного: {stdout}"
     );
     let left = std::fs::read_dir(&covers)
         .expect("каталог кеша читается")
         .count();
-    assert_eq!(left, 0, "файлы кеша удалены");
+    assert_eq!(left, 0, "файлы кеша обложек удалены");
+    let lyrics_left = std::fs::read_dir(&lyrics)
+        .expect("каталог кеша текстов читается")
+        .count();
+    assert_eq!(lyrics_left, 0, "файлы кеша текстов удалены");
 
     // Пустой кеш: код 0, нулевой объём.
     let output = Command::new(env!("CARGO_BIN_EXE_sevfm"))

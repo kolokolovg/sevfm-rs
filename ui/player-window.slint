@@ -1,11 +1,18 @@
 // Окно плеера (design D1–D6 redesign-hero-window; история: D4
-// add-player-ui, D7 add-album-art). Свойства и callbacks связывает
-// main.rs: poll-таймер пишет состояние, play()/stop() запускают и
-// останавливают сессию. Композиция «Герой-обложка»: фон — обложка
+// add-player-ui, D7 add-album-art, add-lyrics-panel). Свойства и
+// callbacks связывает main.rs: poll-таймер пишет состояние,
+// play()/stop() запускают и останавливают сессию, toggle-panel()
+// переключает панель текста. Композиция «Герой-обложка»: фон — обложка
 // трека или заглушка, снизу градиент-затемнение и центрированная
 // колонка: статус с индикатором-точкой, главная строка «что в эфире»
 // (правило видимости TrackSlot), стеклянные кнопки. Отдельной строки
 // станции нет — она живёт в заголовке окна и в заглушке трек-строки.
+// Кнопка «Т» при найденном тексте открывает справа панель текста песни,
+// и кадр окна расширяется 440→880 (спека player-ui «Фиксированный
+// размер окна» в редакции add-lyrics-panel).
+
+// Скролл длинного текста песни (add-lyrics-panel).
+import { ScrollView } from "std-widgets.slint";
 
 // Вид индикатора состояния (design D3): Rust пишет производную
 // UiState; красный вид окно выводит само из видимой ошибки.
@@ -26,6 +33,9 @@ component GlassButton inherits Rectangle {
     in property <bool> strong: false;
     // 0 — «Играть» (треугольник), 1 — «Стоп» (квадрат).
     in property <int> icon-kind: 0;
+    // Квадратный формат кнопки «Т» (add-lyrics-panel): фикс 44×44 вместо
+    // формулы от контента.
+    in property <bool> square: false;
     // Зазор иконка↔текст: свойство, а не литерал — ширится в формулу
     // ширины и в spacing layout'а одним источником (находка ревью
     // oracle: дубль рассинхронился бы при правке).
@@ -36,8 +46,10 @@ component GlassButton inherits Rectangle {
     // Ширина — от контента (поля + иконка + зазор + текст), а не от
     // parent.width: связка «ширина кнопки ← внутренний layout ←
     // parent.width» — цикл, схлопывавший кнопку в ноль (находка
-    // ручной приёмки: «Играть» не рисовалась).
-    width: max(136px, 22px + 13px + root.gap + label.preferred-width + 22px);
+    // ручной приёмки: «Играть» не рисовалась). Квадратная — фикс.
+    width: root.square
+        ? 44px
+        : max(136px, 22px + 13px + root.gap + label.preferred-width + 22px);
     border-radius: self.height / 2;
     opacity: root.enabled ? 1.0 : 0.38;
     border-width: root.strong ? 0px : 1px;
@@ -62,11 +74,15 @@ component GlassButton inherits Rectangle {
         spacing: root.gap;
 
         // Обёртка-центровка: HorizontalLayout растягивает детей по
-        // вертикали — иконка исказилась бы без VerticalLayout.
-        VerticalLayout {
+        // вертикали — иконка исказилась бы без VerticalLayout. Условие
+        // стоит на ребёнке layout'а, а не на иконке внутри обёртки:
+        // пустой ребёнок всё равно занимает слот и spacing — буква «Т»
+        // у квадратной кнопки уезжала на полшага вправо (находка
+        // приёмки 5.3).
+        if root.icon-kind == 0 && !root.square: VerticalLayout {
             alignment: center;
 
-            if root.icon-kind == 0: Path {
+            Path {
                 width: 13px;
                 height: 15px;
                 viewbox-width: 13;
@@ -74,7 +90,11 @@ component GlassButton inherits Rectangle {
                 commands: "M 0 0 L 13 7.5 L 0 15 Z";
                 fill: root.strong ? #14161d : #ffffff;
             }
-            if root.icon-kind == 1: Rectangle {
+        }
+        if root.icon-kind == 1 && !root.square: VerticalLayout {
+            alignment: center;
+
+            Rectangle {
                 width: 12px;
                 height: 12px;
                 border-radius: 2px;
@@ -120,35 +140,59 @@ export component PlayerWindow inherits Window {
     // Гейты кнопок из UiState: «Играть» — только из «Остановлено».
     in-out property <bool> can-play: true;
     in-out property <bool> can-stop: false;
-    // Управление воспроизведением.
+    // Текст песни (change add-lyrics-panel, спека player-ui «Кнопка „Т"
+    // текста песни»/«Панель текста песни»): can-lyrics — кнопка «Т»
+    // активна только при найденном тексте; lyrics — содержимое панели;
+    // lyrics-source — плашка источника в шапке (симметрия ватермарка
+    // обложки); panel-open — состояние панели, им же задаётся ширина
+    // кадра (спека «Фиксированный размер окна»: 440×560 ↔ 880×560).
+    in-out property <bool> can-lyrics: false;
+    in-out property <string> lyrics;
+    in-out property <string> lyrics-source;
+    in-out property <bool> panel-open: false;
+    // Версия сборки в заголовке (просьба пользователя при приёмке
+    // add-lyrics-panel): пишет Rust — Slint окружение не читает.
+    in-out property <string> app-version;
+    // Управление воспроизведением и панелью.
     callback play();
     callback stop();
+    callback toggle-panel();
 
     // Заголовок окна — живое имя станции из icy-name (спека player-ui:
     // в окне оно видно только здесь и в заглушке трек-строки); до его
     // получения и у станций без icy-name — имя приложения (находка
     // ревью hunter: статичный титул врал при запуске с чужим URL).
-    title: root.station != "" ? root.station : "Говорит Севастополь";
+    // Хвост — только версия сборки (без имени приложения — правка
+    // приёмки): имя станции остаётся различимо первым.
+    title: (root.station != "" ? root.station : "Говорит Севастополь")
+        + " — " + root.app-version;
     // Иконка окна (заголовок/таскбар) — единая иконка приложения
     // (герб Севастополя, design D6 add-tray).
     icon: @image-url("app-icon.png");
-    // Фиксированный кадр (спека player-ui «Фиксированный размер окна»):
-    // min = max = preferred, композиция рассчитана на единственный
-    // размер и не должна перестраиваться.
-    preferred-width: 440px;
+    // Фиксированный кадр (спека player-ui «Фиксированный размер окна» в
+    // редакции add-lyrics-panel): размер задаётся состоянием панели,
+    // пользовательский ресайз запрещён в обоих состояниях (min = max =
+    // preferred). Композиция рассчитана на два кадра; расширение и
+    // сжатие — при открытии/закрытии панели, без перезапуска.
+    preferred-width: root.panel-open ? 880px : 440px;
     preferred-height: 560px;
-    min-width: 440px;
-    max-width: 440px;
+    min-width: root.panel-open ? 880px : 440px;
+    max-width: root.panel-open ? 880px : 440px;
     min-height: 560px;
     max-height: 560px;
     background: #0b0d13;
 
     // Слои композиции (design D2, уточнение «Карточка» ручной приёмки):
-    // тёмная подложка → карточка обложки → градиент → контент.
+    // тёмная подложка → карточка обложки → градиент → контент. Композиция
+    // всегда живёт в левой 440-полосе (add-lyrics-panel): кламп к 440, а
+    // не ветка «panel-open ? 440 : root.width» — иначе при закрытии панели
+    // состав растягивается на ещё не сжатое окно (880) и сжимается следом:
+    // двойная перекомпоновка = видимое дёрганье (находка приёмки 5.3;
+    // при открытии дёрганья нет, потому что ветка сразу давала 440).
     Rectangle {
         x: 0;
         y: 0;
-        width: root.width;
+        width: min(root.width, 440px);
         height: root.height;
 
         // Обложка-карточка по центру: 350×350, скругление через clip
@@ -158,7 +202,7 @@ export component PlayerWindow inherits Window {
         Rectangle {
             width: 350px;
             height: 350px;
-            x: (root.width - self.width) / 2;
+            x: (parent.width - self.width) / 2;
             y: root.height * 0.34 - self.height / 2;
             border-radius: 16px;
             clip: true;
@@ -293,7 +337,7 @@ export component PlayerWindow inherits Window {
                 Rectangle {
                     height: 40px;
                     width: min(error-text.preferred-width + 26px,
-                        root.width - 52px);
+                        parent.width);
                     border-radius: 10px;
                     background: rgba(214, 54, 80, 0.22);
                     border-width: 1px;
@@ -311,8 +355,11 @@ export component PlayerWindow inherits Window {
                 }
             }
 
-            // Управление: ровно два — «Играть» и «Стоп»; strong —
-            // доступная кнопка (гейты взаимоисключающие).
+            // Управление: «Играть», «Стоп» и «Т» (add-lyrics-panel);
+            // strong — доступная кнопка (гейты взаимоисключающие).
+            // «Т» активна только при найденном тексте; светлая — когда
+            // панель открыта (состояние-переключатель, крестика в панели
+            // нет — закрытие только повторным «Т»).
             HorizontalLayout {
                 alignment: center;
                 spacing: 12px;
@@ -330,6 +377,109 @@ export component PlayerWindow inherits Window {
                     strong: root.can-stop;
                     enabled: root.can-stop;
                     clicked => { root.stop(); }
+                }
+                GlassButton {
+                    text: "Т";
+                    square: true;
+                    // Светлая заливка = «текст есть» (конвенция «Играть»:
+                    // strong от enabled), буква — тёмная; состояние панели
+                    // на вид кнопки не влияет (правка приёмки 5.3).
+                    strong: root.can-lyrics;
+                    enabled: root.can-lyrics;
+                    clicked => { root.toggle-panel(); }
+                }
+            }
+        }
+    }
+
+    // Панель текста песни (change add-lyrics-panel, спека player-ui
+    // «Панель текста песни»): правая половина расширенного кадра —
+    // однотонная тёмная подложка, шапка с плашкой источника, строка
+    // трека и сплошной текст со скроллом. Кнопки закрытия нет:
+    // закрытие — только повторным «Т» (спека «Кнопка „Т" текста песни»).
+    if root.panel-open: Rectangle {
+        x: 440px;
+        y: 0;
+        width: root.width - 440px;
+        height: root.height;
+        background: #10131c;
+        border-width: 1px;
+        border-color: rgba(255, 255, 255, 0.08);
+
+        VerticalLayout {
+            padding: 20px;
+            spacing: 10px;
+
+            // Шапка: заголовок + плашка источника текста (симметрия
+            // ватермарка обложки design D5 add-cover-source-watermark),
+            // плашка вплотную к заголовку; ширина — от естественной
+            // ширины текста, как у ватермарка обложки (находка приёмки:
+            // без явной ширины элемент растягивается на всю строку).
+            Rectangle {
+                height: 24px;
+
+                header-text := Text {
+                    x: 0;
+                    y: (parent.height - self.height) / 2;
+                    text: "ТЕКСТ ПЕСНИ";
+                    color: rgba(255, 255, 255, 0.72);
+                    font-size: 12px;
+                    font-weight: 700;
+                    letter-spacing: 1.4px;
+                }
+                if root.lyrics-source != "": Rectangle {
+                    x: header-text.preferred-width + 10px;
+                    y: (parent.height - self.height) / 2;
+                    height: 21px;
+                    width: lyrics-chip.preferred-width + 16px;
+                    border-radius: 8px;
+                    background: rgba(255, 255, 255, 0.08);
+
+                    lyrics-chip := Text {
+                        x: 8px;
+                        width: parent.width - 16px;
+                        vertical-alignment: center;
+                        color: rgba(255, 255, 255, 0.62);
+                        font-size: 12px;
+                        text: root.lyrics-source;
+                    }
+                }
+            }
+
+            // Строка трека: те же данные, что и главная строка окна
+            // (артист уже капсом — пишет связка).
+            if root.track-title != "": Text {
+                text: root.artist != ""
+                    ? root.artist + " — " + root.track-title
+                    : root.track-title;
+                color: rgba(255, 255, 255, 0.62);
+                font-size: 13px;
+                overflow: elide;
+            }
+
+            // Сплошной текст со скроллом, когда не влезает (спека
+            // «Прокрутка длинного текста»); пустое содержимое — пустой
+            // просмотрщик: текст скрыт при поиске нового трека (спека
+            // «Смена трека при открытой панели»). Два биндинга обязательны
+            // (находка приёмки 5.3, паттерн textedit-base из std-widgets):
+            // ширина текста = видимая ширина вьюпорта (перенос строк), и
+            // явная content-height = высота переносного layout'а — иначе
+            // Flickable растягивает ребёнка до вьюпорта, запас прокрутки
+            // нулевой и полоса не появляется вовсе.
+            lyrics-scroll := ScrollView {
+                vertical-stretch: 1;
+                content-height: max(self.visible-height, lyrics-text.preferred-height);
+                // Прокрутка перетаскиванием (просьба приёмки 5.3): виджет
+                // по умолчанию глушит drag-pan — только колесо; зажать
+                // кнопку на тексте и тянуть тоже должно скроллить.
+                mouse-drag-pan-enabled: true;
+
+                lyrics-text := Text {
+                    width: lyrics-scroll.visible-width;
+                    text: root.lyrics;
+                    wrap: word-wrap;
+                    color: rgba(255, 255, 255, 0.62);
+                    font-size: 15px;
                 }
             }
         }

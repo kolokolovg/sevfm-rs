@@ -61,8 +61,20 @@ jobs:
       - name: Виртуальное аудио (ALSA null)
         run: |
           printf 'pcm.!default { type null }\nctl.!default { type null }\n' > ~/.asoundrc
+      # cargo-nextest вместо cargo test: каждый тест в своём процессе,
+      # параллель без рассинхрона вывода. Версия запина — supply chain
+      # (находка ревью 2026-11-04); локально тот же 0.9.152 прогнал 158/158.
+      - name: Установка cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.152
+      # Живые сетевые тесты помечены #[ignore] и не запускаются (как и
+      # в cargo test). Doctests nextest не гоняет принципиально — их
+      # добивает отдельный шаг.
       - name: Офлайн-тесты
-        run: cargo test
+        run: cargo nextest run
+      - name: Doctests
+        run: cargo test --doc
 
   windows:
     name: сборка exe (windows)

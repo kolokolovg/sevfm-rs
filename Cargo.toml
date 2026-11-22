@@ -1,6 +1,6 @@
 [package]
 name = "sevfm"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 description = "Настольный плеер онлайн-радио «Говорит Севастополь»"
 license = "Apache-2.0"

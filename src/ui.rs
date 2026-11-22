@@ -131,6 +131,34 @@ pub enum TrackSlot {
     Placeholder { station: Option<String> },
 }
 
+/// Состояние текста песни для окна (change add-lyrics-panel, design D4):
+/// ищется, найден (текст и имя источника) или нет. `Found` —
+/// единственное состояние, при котором кнопка «Т» активна (спека
+/// player-ui «Кнопка „Т" текста песни»); `Searching`/`Missing` гасят и
+/// кнопку, и содержимое панели (спека «Смена трека при открытой панели»).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum LyricsSlot {
+    /// Поиск идёт (музыкальный трек появился, ответа ещё нет).
+    Searching,
+    /// Текст найден: содержимое и имя источника для плашки панели.
+    Found {
+        text: String,
+        source: Option<String>,
+    },
+    /// Текста нет: промах источника, не-музыка, авария воркера.
+    Missing,
+}
+
+/// Исходный слот текста по содержимому трек-строки (спека lyrics
+/// «Не-музыка не ищется»): музыкальный трек — поиск запущен; сырое
+/// название, вставка и заглушка — «текста нет» без сети.
+pub fn lyrics_slot_for_track(track: &TrackSlot) -> LyricsSlot {
+    match track {
+        TrackSlot::Track { .. } => LyricsSlot::Searching,
+        TrackSlot::Title { .. } | TrackSlot::Placeholder { .. } => LyricsSlot::Missing,
+    }
+}
+
 /// Модель окна с дедупликацией по переходам (задача 2.2, эволюция
 /// `NowPlayingPrinter`): poll снимка сессии отдаёт только изменения
 /// станции, трека, статуса и ошибки относительно прошлого опроса.
@@ -143,6 +171,9 @@ pub struct PlayerView {
     /// заглушка «Остановлено» дают один слот, а в логе различимы.
     ether: Option<TrackInfo>,
     status: UiState,
+    /// Слот текста песни с дедупликацией (change add-lyrics-panel):
+    /// None — ещё не публиковался (новая сессия до первого ответа).
+    lyrics: Option<LyricsSlot>,
     error_shown: bool,
 }
 
@@ -160,15 +191,38 @@ impl PlayerView {
             track: TrackSlot::Placeholder { station: None },
             ether: None,
             status: UiState::Stopped,
+            lyrics: None,
             error_shown: false,
         }
     }
 
     /// Сброс перед новой сессией: следующий poll переиздаст станцию,
     /// трек и статус заново (дедупликация не должна глотать первое
-    /// появление значений новой сессии).
+    /// появление значений новой сессии). Слот текста тоже: следующий
+    /// [`PlayerView::update_lyrics`] переиздаст его в окно.
     pub fn reset(&mut self) {
         *self = Self::new();
+    }
+
+    /// Новый слот текста от обвязки (смена трека или ответ воркера,
+    /// change add-lyrics-panel) с дедупликацией по значению: `Some` —
+    /// слот изменился и его нужно записать в окно. Отдельно от poll:
+    /// текст приходит от воркера, а не от снимка сессии.
+    pub fn update_lyrics(&mut self, slot: LyricsSlot) -> Option<LyricsSlot> {
+        if self.lyrics.as_ref() != Some(&slot) {
+            self.lyrics = Some(slot.clone());
+            Some(slot)
+        } else {
+            None
+        }
+    }
+
+    /// Слот застрял в поиске (ответа воркера ещё нет): при смерти воркера
+    /// потребитель гасит его немедленно, не дожидаясь смены трека —
+    /// иначе открытая пустая панель с неактивной кнопкой «Т» несводима
+    /// (дед-энд D12; находка hunter-ревью).
+    pub fn lyrics_searching(&self) -> bool {
+        self.lyrics.as_ref() == Some(&LyricsSlot::Searching)
     }
 
     /// Сравнивает снимок с предысторией и отдаёт только изменения.
@@ -603,6 +657,83 @@ mod tests {
         let update = view.poll(&connected);
         assert_eq!(update.station, Some(Some("станция".into())));
         assert_eq!(update.track, Some(placeholder(Some("станция"))));
+    }
+
+    /// Исходный слот текста по трек-строке (change add-lyrics-panel,
+    /// спека lyrics «Не-музыка не ищется»): музыкальный трек — поиск,
+    /// сырое название/вставка/заглушка — «текста нет» без сети.
+    #[test]
+    fn lyrics_slot_for_track_follows_visibility_rule() {
+        assert_eq!(
+            lyrics_slot_for_track(&TrackSlot::Track {
+                artist: "Кино".into(),
+                title: "Группа крови".into(),
+            }),
+            LyricsSlot::Searching
+        );
+        assert_eq!(
+            lyrics_slot_for_track(&TrackSlot::Title {
+                title: "сырой StreamTitle".into()
+            }),
+            LyricsSlot::Missing
+        );
+        assert_eq!(
+            lyrics_slot_for_track(&placeholder(Some("станция"))),
+            LyricsSlot::Missing
+        );
+    }
+
+    /// Дедупликация слота текста (change add-lyrics-panel): первое
+    /// значение переиздаётся, повторное — нет, смена — да; reset
+    /// возвращает модель к переизданию.
+    #[test]
+    fn player_view_update_lyrics_dedups_transitions() {
+        let mut view = PlayerView::new();
+        let found = |text: &str| LyricsSlot::Found {
+            text: text.to_owned(),
+            source: Some("LrcLib".into()),
+        };
+
+        // Первое значение — выдаётся; то же — нет.
+        assert_eq!(
+            view.update_lyrics(LyricsSlot::Searching),
+            Some(LyricsSlot::Searching)
+        );
+        assert_eq!(view.update_lyrics(LyricsSlot::Searching), None);
+
+        // Ответ воркера — переход в Found с содержимым.
+        assert_eq!(view.update_lyrics(found("текст")), Some(found("текст")));
+        assert_eq!(view.update_lyrics(found("текст")), None, "тот же слот");
+
+        // Смена трека: поиск нового — снова выдаётся.
+        assert_eq!(
+            view.update_lyrics(LyricsSlot::Searching),
+            Some(LyricsSlot::Searching)
+        );
+
+        // Сброс сессии: следующее значение переиздаётся.
+        view.reset();
+        assert_eq!(
+            view.update_lyrics(LyricsSlot::Missing),
+            Some(LyricsSlot::Missing)
+        );
+    }
+
+    /// Признак застрявшего поиска (находка hunter-ревью): true до ответа
+    /// воркера, false у результата и после сброса сессии.
+    #[test]
+    fn lyrics_searching_tracks_pending_state() {
+        let mut view = PlayerView::new();
+        assert!(!view.lyrics_searching(), "до первого значения поиска нет");
+        view.update_lyrics(LyricsSlot::Searching);
+        assert!(view.lyrics_searching());
+        view.update_lyrics(LyricsSlot::Found {
+            text: "текст".into(),
+            source: Some("LrcLib".into()),
+        });
+        assert!(!view.lyrics_searching(), "ответ пришёл — поиска нет");
+        view.reset();
+        assert!(!view.lyrics_searching(), "сброс гасит слот");
     }
 
     /// Разбор аргументов (задача 2.3): все ветки — позиционный URL,
