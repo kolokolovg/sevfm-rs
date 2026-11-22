@@ -27,6 +27,53 @@ export enum StatusKind {
 // «strong» — вариант доступной кнопки (светлая заливка), иконки —
 // векторные примитивы без ассетов: Path-треугольник «Играть»,
 // квадрат «Стоп».
+// Марки-скролл переполненной трек-строки (add-title-artist-scroll):
+// строка, не помещающаяся в поле, прокатывается туда-обратно,
+// помещающаяся стоит по центру без движения. Гейт enabled у animate
+// обязателен: без него бесконечная анимация пинг-понговала бы вокруг
+// центра и на короткой строке. Детекция — preferred-width при
+// no-wrap: от назначенной ширины не зависит, цикла лэйаута нет (как
+// у плашки ошибки). Скорость ~28 px/с, зажата в 3–30 с на проход,
+// чтобы длинные названия не «летели». Ширина контейнера приходит
+// от layout'а (100% родителя), высота — по тексту.
+component MarqueeText inherits Rectangle {
+    in property <string> text;
+    in property <color> text-color;
+    in property <length> text-font-size;
+    in property <int> text-font-weight;
+    in property <length> text-letter-spacing;
+
+    clip: true;
+    height: line.preferred-height;
+    property <bool> scrolling: line.preferred-width > root.width;
+
+    line := Text {
+        text: root.text;
+        color: root.text-color;
+        font-size: root.text-font-size;
+        font-weight: root.text-font-weight;
+        letter-spacing: root.text-letter-spacing;
+        wrap: no-wrap;
+        overflow: clip;
+        width: self.preferred-width;
+        x: root.scrolling
+            ? (parent.width - self.width)      // крайнее: конец строки целиком
+            // покой: помещающаяся строка по центру поля; переполненная
+            // (в мёртвой зоне до старта анимации её нет) — у левого
+            // края, иначе центр широкой строки давал обрезку с обеих
+            // сторон при стоящем тексте
+            : max(0px, (parent.width - self.width) / 2);
+
+        animate x {
+            enabled: root.scrolling;
+            duration: max(3000ms, min(30000ms,
+                (self.preferred-width - parent.width) / 1px * 36ms));
+            iteration-count: -1;
+            direction: alternate;
+        }
+    }
+}
+
 component GlassButton inherits Rectangle {
     in property <bool> enabled: true;
     in property <string> text;
@@ -206,9 +253,10 @@ export component PlayerWindow inherits Window {
             y: root.height * 0.34 - self.height / 2;
             border-radius: 16px;
             clip: true;
-            drop-shadow-blur: 30px;
-            drop-shadow-color: rgba(0, 0, 0, 0.55);
-            drop-shadow-offset-y: 12px;
+            // drop-shadow снят: в slint 1.19 software-рендерер впервые
+            // отливает тени и lint требует для этого background/border,
+            // но в 1.18 (принятый вид v0.1.8) тень этим рендерером
+            // не рисовалась вовсе — свойства были мёртвыми.
 
             Image {
                 width: 100%;
@@ -310,22 +358,18 @@ export component PlayerWindow inherits Window {
             // кладёт станцию в track-title, отдельной ветки не нужно —
             // находка ревью hunter: пустой Text резервировал высоту
             // строки, статус прыгал при появлении станции).
-            if root.artist != "": Text {
+            if root.artist != "": MarqueeText {
                 text: root.artist;
-                color: rgba(255, 255, 255, 0.62);
-                font-size: 13px;
-                font-weight: 500;
-                letter-spacing: 1.2px;
-                horizontal-alignment: center;
-                overflow: elide;
+                text-color: rgba(255, 255, 255, 0.62);
+                text-font-size: 13px;
+                text-font-weight: 500;
+                text-letter-spacing: 1.2px;
             }
-            if root.track-title != "": Text {
+            if root.track-title != "": MarqueeText {
                 text: root.track-title;
-                color: #ffffff;
-                font-size: 25px;
-                font-weight: 700;
-                horizontal-alignment: center;
-                overflow: elide;
+                text-color: #ffffff;
+                text-font-size: 25px;
+                text-font-weight: 700;
             }
 
             // Ошибка сессии (фатальная): стеклянная красная плашка до
@@ -454,7 +498,10 @@ export component PlayerWindow inherits Window {
                     : root.track-title;
                 color: rgba(255, 255, 255, 0.62);
                 font-size: 13px;
-                overflow: elide;
+                // Длинная связка «артист — название» переносится на
+                // следующие строки: elide прятал хвост за многоточием
+                // (находка приёмки add-title-artist-scroll)
+                wrap: word-wrap;
             }
 
             // Сплошной текст со скроллом, когда не влезает (спека
