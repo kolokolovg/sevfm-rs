@@ -42,8 +42,8 @@ use sevfm::net::{PlaybackStatus, playback_status};
 use sevfm::session::{PlayerSession, SessionHandle, SessionOutcome};
 use sevfm::tray::TraySnapshot;
 use sevfm::ui::{
-    LyricsSlot, PlayerView, StatusKind as UiStatusKind, TrackSlot, UiState, lyrics_slot_for_track,
-    parse_args,
+    LyricsSlot, PlayerView, STATIONS, StatusKind as UiStatusKind, SwitchPlan, TrackSlot, UiState,
+    lyrics_slot_for_track, parse_args, station_index_for, switch_plan,
 };
 use sevfm::{redact_url, sanitize_multiline_display, say};
 
@@ -131,6 +131,11 @@ struct UiBinding {
     /// Панель текста открыта (спека player-ui «Кнопка „Т" текста
     /// песни»): состояние держит связка — единый владелец данных окна.
     panel_open: bool,
+    /// Отложенный автозапуск переключённого эфира (change
+    /// add-station-switcher): взводится переключателем при живой сессии,
+    /// доедает poll-такт при открытом гейте can-play; «Играть» и «Стоп»
+    /// его гасят — ручная команда сильнее автозапуска.
+    pending_play: bool,
 }
 
 impl UiBinding {
@@ -143,6 +148,7 @@ impl UiBinding {
             covers: Covers::start(),
             lyrics: Lyrics::start(),
             panel_open: false,
+            pending_play: false,
         }
     }
 }
@@ -172,6 +178,10 @@ fn command_play(binding: &SharedUiBinding, window: &PlayerWindow) {
     let mut ui = binding
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Ручное «Играть» сильнее отложенного автозапуска переключателя
+    // (change add-station-switcher): в т.ч. поглощает уже
+    // consumируемый pending — двойной старт невозможен, гейт ниже.
+    ui.pending_play = false;
     if ui
         .session
         .as_ref()
@@ -194,7 +204,10 @@ fn command_play(binding: &SharedUiBinding, window: &PlayerWindow) {
             ui.view.reset();
             // Поля прошлой сессии не имеют отношения к новой:
             // статус и гейты обновит ближайший poll-такт.
-            window.set_station("".into());
+            // Имя встроенного эфира — сразу (change add-station-switcher):
+            // титул до icy-name не врёт чужим именем; пользовательский
+            // URL — пусто (fallback разметки).
+            window.set_station(builtin_station_name(&ui.url).into());
             window.set_artist("".into());
             window.set_track_title("".into());
             window.set_error("".into());
@@ -220,7 +233,7 @@ fn command_play(binding: &SharedUiBinding, window: &PlayerWindow) {
             // Поля прошлой сессии не переживают неудачный старт:
             // трек и обложка погашены, плашка ошибки — не поверх чужого
             // трека (находка ревью hunter).
-            window.set_station("".into());
+            window.set_station(builtin_station_name(&ui.url).into());
             window.set_artist("".into());
             window.set_track_title("".into());
             window.set_error(format!("не удалось запустить поток чтения: {e}").into());
@@ -292,12 +305,80 @@ fn command_toggle_panel(binding: &SharedUiBinding, window: &PlayerWindow) {
 /// глушит вывод и освобождает устройство за такт опроса, статус уходит
 /// в «Остановлено» по факту завершения воркера (ближайший poll-такт).
 fn command_stop(binding: &SharedUiBinding) {
-    let ui = binding
+    // «Стоп» сильнее отложенного автозапуска переключателя (change
+    // add-station-switcher): пользователь попросил тишину.
+    let mut ui = binding
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    ui.pending_play = false;
     if let Some(session) = ui.session.as_ref() {
         say("стоп: остановка сессии");
         session.stop();
+    }
+}
+
+/// Имя встроенного эфира для титула и заглушки до icy-name (change
+/// add-station-switcher): пользовательский URL — пусто (fallback
+/// разметки).
+fn builtin_station_name(url: &str) -> &'static str {
+    let idx = station_index_for(url);
+    if idx >= 0 {
+        STATIONS[idx as usize].name
+    } else {
+        ""
+    }
+}
+
+/// Переключение эфира сегментом (change add-station-switcher): политика
+/// — в чистой `switch_plan`; хендлер исполняет. Активный эфир — no-op;
+/// живая сессия — мгновенный сброс отображения (правила новой сессии
+/// из command_play), stop и отложенный автозапуск; остановленный плеер —
+/// только выбор, звук не запускается (спека player-ui «Переключатель
+/// эфиров»).
+fn command_switch_station(binding: &SharedUiBinding, window: &PlayerWindow, requested: i32) {
+    if requested < 0 || requested as usize >= STATIONS.len() {
+        return;
+    }
+    let mut ui = binding
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let active = station_index_for(&ui.url);
+    let running = ui
+        .session
+        .as_ref()
+        .is_some_and(|session| session.is_running());
+    match switch_plan(active, requested, running) {
+        SwitchPlan::Noop => {}
+        SwitchPlan::SelectOnly => {
+            ui.url = STATIONS[requested as usize].url.to_string();
+            window.set_station_index(requested);
+        }
+        SwitchPlan::StopAndAutoPlay => {
+            ui.url = STATIONS[requested as usize].url.to_string();
+            window.set_station_index(requested);
+            ui.pending_play = true;
+            // Отображение новой сессии — сразу, не по факту teardown;
+            // сбросы повторяют command_play (спека: правила новой сессии).
+            window.set_station(builtin_station_name(&ui.url).into());
+            window.set_artist("".into());
+            window.set_track_title("".into());
+            window.set_error("".into());
+            ui.covers.invalidate();
+            ui.lyrics.invalidate();
+            ui.panel_open = false;
+            window.set_panel_open(false);
+            window.set_can_lyrics(false);
+            window.set_lyrics("".into());
+            window.set_lyrics_source("".into());
+            // Заглушка берётся в момент команды: держать Image в
+            // межпоточных замыканиях нельзя (не Send) — здесь поток свой.
+            let placeholder_cover = window.get_placeholder_cover();
+            window.set_cover(placeholder_cover);
+            window.set_cover_source("".into());
+            if let Some(session) = ui.session.as_ref() {
+                session.stop();
+            }
+        }
     }
 }
 
@@ -848,6 +929,42 @@ fn run_ui(binding: &SharedUiBinding, process_stop: &Arc<AtomicBool>) -> i32 {
             command_toggle_panel(&binding, &window);
         });
     }
+    // Переключатель эфиров (change add-station-switcher): сегмент живёт
+    // в окне — callback и так на потоке цикла событий, доставка не нужна.
+    {
+        let binding = binding.clone();
+        let weak = window.as_weak();
+        window.on_switch_station(move |requested| {
+            let Some(window) = weak.upgrade() else { return };
+            command_switch_station(&binding, &window, requested);
+        });
+    }
+    // Герб-заглушка для mpris:artUrl (change add-mpris-placeholder-art):
+    // извлекается один раз при старте — тот же ассет, что рисует окно;
+    // недоступный каталог — деградация (artUrl опускается, как раньше).
+    // Только Linux: единственный потребитель — poll-такт MPRIS.
+    #[cfg(target_os = "linux")]
+    let placeholder_art =
+        sevfm::cover::ensure_placeholder_cover().map(|path| sevfm::mpris::file_uri(&path));
+    // Имена эфиров — из константы (один источник правды с Rust), активный
+    // индекс — по URL запуска: пользовательский URL даёт сегмент без
+    // выделения (спека player-ui «Переключатель эфиров»).
+    window.set_station_names(
+        std::rc::Rc::new(slint::VecModel::from(
+            STATIONS
+                .iter()
+                .map(|station| slint::SharedString::from(station.name))
+                .collect::<Vec<_>>(),
+        ))
+        .into(),
+    );
+    window.set_station_index(station_index_for(
+        binding
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .url
+            .as_str(),
+    ));
 
     // Poll-таймер (design D3): создаётся в главном потоке (ограничение
     // Slint — поток, не факт запуска цикла) и живёт до конца run_ui —
@@ -890,16 +1007,20 @@ fn run_ui(binding: &SharedUiBinding, process_stop: &Arc<AtomicBool>) -> i32 {
             }
             #[cfg(target_os = "linux")]
             if let Some(mpris) = mpris.as_ref() {
-                // artUrl — только у музыкального трека с обложкой
-                // в кеше (спека mpris); имя файла — sha256, но базовый
-                // каталог из XDG/HOME требует экранирования (находка
-                // аудита — sevfm::mpris::file_uri).
+                // artUrl зеркалит обложку окна (change
+                // add-mpris-placeholder-art): у музыкального трека —
+                // кеш-обложка, во всех состояниях заглушки (вставка,
+                // сырой StreamTitle, остановка, трек без обложки) —
+                // герб. Имя файла кеша — sha256, базовый каталог из
+                // XDG/HOME требует экранирования (находка аудита —
+                // sevfm::mpris::file_uri).
                 let art_url = match &snapshot.track {
                     TrackSlot::Track { artist, title } => {
                         sevfm::cover::cached_cover_path(artist, title)
                             .map(|path| sevfm::mpris::file_uri(&path))
+                            .or_else(|| placeholder_art.clone())
                     }
-                    _ => None,
+                    _ => placeholder_art.clone(),
                 };
                 mpris.push(mpris_service::MprisUpdate {
                     playback: sevfm::mpris::MprisPlayback::of(&snapshot),
@@ -1099,6 +1220,15 @@ fn run_ui(binding: &SharedUiBinding, process_stop: &Arc<AtomicBool>) -> i32 {
                         say(&format!("эфир: {title}"));
                     }
                 }
+            }
+            // Отложенный автозапуск переключённого эфира (change
+            // add-station-switcher): воркер прошлой сессии завершился,
+            // гейт can-play открылся в этом же такте — играем выбранный
+            // эфир общим command_play (гейт внутри не пустит раньше).
+            if ui.pending_play && window.get_can_play() {
+                ui.pending_play = false;
+                drop(ui);
+                command_play(&binding, &window);
             }
         });
     }

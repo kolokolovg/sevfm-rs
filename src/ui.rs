@@ -290,6 +290,60 @@ pub struct Launch {
     pub url: String,
 }
 
+/// Встроенный эфир переключателя (change add-station-switcher): имя —
+/// для сегмента окна и титула до icy-name, URL — для сессии.
+pub struct StationDef {
+    pub name: &'static str,
+    pub url: &'static str,
+}
+
+/// Два эфира сервера (спека radio-player «Подключение к потоку»):
+/// «Говорит Севастополь» — по умолчанию при запуске, «Севастополь FM» —
+/// второй маунт того же хоста (проверен живьём 2026-11-22).
+pub const STATIONS: [StationDef; 2] = [
+    StationDef {
+        name: "Говорит Севастополь",
+        url: DEFAULT_STREAM_URL,
+    },
+    StationDef {
+        name: "Севастополь FM",
+        url: "https://sevfm.ru:9006/stream",
+    },
+];
+
+/// Индекс встроенного эфира по URL: `-1` — не совпал ни с одним
+/// (пользовательский URL запуска — сегмент без выделения).
+pub fn station_index_for(url: &str) -> i32 {
+    STATIONS
+        .iter()
+        .position(|station| station.url == url)
+        .map_or(-1, |idx| idx as i32)
+}
+
+/// Исход переключения эфира (спека player-ui «Переключатель эфиров»):
+/// активный — no-op; живая сессия — stop с отложенным автозапуском;
+/// остановленный плеер — только выбор, без запуска звука.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SwitchPlan {
+    Noop,
+    SelectOnly,
+    StopAndAutoPlay,
+}
+
+/// Решение о переключении: чистая функция над текущим индексом, выбором
+/// и живостью сессии — вся политика в одном месте, хендлер окна только
+/// исполняет.
+pub fn switch_plan(active: i32, requested: i32, session_running: bool) -> SwitchPlan {
+    if requested == active {
+        return SwitchPlan::Noop;
+    }
+    if session_running {
+        SwitchPlan::StopAndAutoPlay
+    } else {
+        SwitchPlan::SelectOnly
+    }
+}
+
 /// Разбор аргументов командной строки (design D6, без clap): флаг
 /// `--headless` в любой позиции, первый позиционный аргумент — URL.
 /// Ошибки — неизвестный флаг, повторный `--headless`, лишний
@@ -857,5 +911,36 @@ mod tests {
         // Дефолтный URL станции валиден (в обоих режимах запуска).
         parse_args(args(&[])).expect("дефолтный URL валиден");
         parse_args(args(&["--headless"])).expect("дефолтный URL валиден в headless");
+    }
+
+    /// Индекс встроенного эфира по URL (change add-station-switcher):
+    /// оба эфира резолвятся, пользовательский URL даёт -1.
+    #[test]
+    fn station_index_maps_builtin_urls() {
+        assert_eq!(station_index_for(STATIONS[0].url), 0);
+        assert_eq!(station_index_for(STATIONS[1].url), 1);
+        assert_eq!(station_index_for("http://example.com/stream"), -1);
+        // Константа эфиров согласована с дефолтом запуска: первый —
+        // станция по умолчанию.
+        assert_eq!(STATIONS[0].url, DEFAULT_STREAM_URL);
+    }
+
+    /// Политика переключения (спека player-ui «Переключатель эфиров»):
+    /// активный — no-op; живая сессия — stop + автозапуск; остановленный
+    /// плеер — только выбор, звук не запускается.
+    #[test]
+    fn switch_plan_follows_spec() {
+        use SwitchPlan::{Noop, SelectOnly, StopAndAutoPlay};
+        // Повторный выбор активного — no-op независимо от сессии.
+        assert_eq!(switch_plan(0, 0, true), Noop);
+        assert_eq!(switch_plan(1, 1, false), Noop);
+        // Живая сессия: другой эфир — stop и автозапуск.
+        assert_eq!(switch_plan(0, 1, true), StopAndAutoPlay);
+        // Остановленный плеер: только выделение, без запуска звука.
+        assert_eq!(switch_plan(0, 1, false), SelectOnly);
+        // Пользовательский URL (индекс -1): выбор встроенного — обычный
+        // путь, повторный выбор «ничего» — no-op.
+        assert_eq!(switch_plan(-1, 0, true), StopAndAutoPlay);
+        assert_eq!(switch_plan(-1, -1, true), Noop);
     }
 }

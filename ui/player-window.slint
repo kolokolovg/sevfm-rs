@@ -11,7 +11,8 @@
 // и кадр окна расширяется 440→880 (спека player-ui «Фиксированный
 // размер окна» в редакции add-lyrics-panel).
 
-// Скролл длинного текста песни (add-lyrics-panel).
+// Панель текста песни — ScrollView с ВЫКЛЮЧЕННОЙ полосой прокрутки
+// (приёмка switcher: листать без видимой полосы — always-off).
 import { ScrollView } from "std-widgets.slint";
 
 // Вид индикатора состояния (design D3): Rust пишет производную
@@ -24,9 +25,11 @@ export enum StatusKind {
 
 // Стеклянная кнопка поверх фона-обложки (design D4): свой компонент
 // вместо std-widgets — нативная кнопка не встраивается в композицию.
-// «strong» — вариант доступной кнопки (светлая заливка), иконки —
-// векторные примитивы без ассетов: Path-треугольник «Играть»,
-// квадрат «Стоп».
+// «strong» — вариант доступной кнопки: стекло плотнее (glass-strong
+// мокапа A), не сплошная белая заливка — в мокапе её не существовало,
+// и пара «тёмная невидимая + белая слепящая» читалась как поломка
+// (приёмка switcher). Иконки — векторные примитивы без ассетов:
+// Path-треугольник «Играть», квадрат «Стоп».
 // Марки-скролл переполненной трек-строки (add-title-artist-scroll):
 // строка, не помещающаяся в поле, прокатывается туда-обратно,
 // помещающаяся стоит по центру без движения. Гейт enabled у animate
@@ -83,78 +86,127 @@ component GlassButton inherits Rectangle {
     // Квадратный формат кнопки «Т» (add-lyrics-panel): фикс 44×44 вместо
     // формулы от контента.
     in property <bool> square: false;
-    // Зазор иконка↔текст: свойство, а не литерал — ширится в формулу
-    // ширины и в spacing layout'а одним источником (находка ревью
-    // oracle: дубль рассинхронился бы при правке).
-    property <length> gap: 9px;
+    // Круглая иконка без текста (мокап A, change add-station-switcher):
+    // транспорт «Играть»/«Стоп» — окружность 64px, назначение по иконке.
+    in property <bool> circle: false;
     callback clicked();
 
-    height: 44px;
-    // Ширина — от контента (поля + иконка + зазор + текст), а не от
-    // parent.width: связка «ширина кнопки ← внутренний layout ←
-    // parent.width» — цикл, схлопывавший кнопку в ноль (находка
-    // ручной приёмки: «Играть» не рисовалась). Квадратная — фикс.
-    width: root.square
-        ? 44px
-        : max(136px, 22px + 13px + root.gap + label.preferred-width + 22px);
-    border-radius: self.height / 2;
-    opacity: root.enabled ? 1.0 : 0.38;
-    border-width: root.strong ? 0px : 1px;
-    border-color: rgba(255, 255, 255, 0.22);
+    height: root.circle ? 64px : 44px;
+    width: root.circle ? 64px : 44px;
+    // Скругление: транспорт — окружность (circle), «Т» — скруглённый
+    // квадрат 12px (мокап A, .gbtn.t border-radius 12px). Единое
+    // height/2 на 44×44 давало окружность и там, где нужен квадрат
+    // («кнопка текста круглая», приёмка switcher).
+    border-radius: root.circle ? self.height / 2 : 12px;
+    border-width: 1px;
+    border-color: rgba(255, 255, 255, 0.14);
+    // Стекло мокапа A: glass .10 / glass-strong .20, кайма одна и та же;
+    // нажатие и наведение ступенчато плотнее. Иконки и текст всегда
+    // светлые — тёмных иконок на кнопках в мокапе нет.
     background: root.strong
-        ? (ta.pressed ? rgba(255, 255, 255, 0.80) : rgba(255, 255, 255, 0.94))
-        : (ta.pressed ? rgba(255, 255, 255, 0.08)
-            : ta.has-hover ? rgba(255, 255, 255, 0.18)
-            : rgba(255, 255, 255, 0.12));
+        ? (ta.pressed ? rgba(255, 255, 255, 0.32)
+            : ta.has-hover ? rgba(255, 255, 255, 0.26)
+            : rgba(255, 255, 255, 0.20))
+        : (ta.pressed ? rgba(255, 255, 255, 0.22)
+            : ta.has-hover ? rgba(255, 255, 255, 0.16)
+            : rgba(255, 255, 255, 0.10));
 
     ta := TouchArea {
         enabled: root.enabled;
         clicked => { root.clicked(); }
     }
 
+    // Значки центрируются ЯВНО координатами, без layout-слотов: у
+    // круглых кнопок текста нет, но любые слоты в HorizontalLayout
+    // (пустой Text, spacing) дважды смещали значок от центра (замеры
+    // приёмки switcher). Размеры 16×18/15×15 — 13×15 и 12×12 в круге
+    // 64px пользователь отверг как «мелко» (замер по кропу). Треугольнику
+    // +2px оптики: его центр массы на 1/3 ширины от левого края, и даже
+    // рамочно-центрованный он «смотрит» сдвинутым влево (замер: жалоба
+    // «не выровнено» при геометрически точных центрах). Недоступная
+    // кнопка не гасится целиком (opacity-гашение исчезало с тёмного
+    // фона) — приглушается только значок.
+    if root.circle && root.icon-kind == 0: Path {
+        width: 16px;
+        height: 18px;
+        viewbox-width: 16;
+        viewbox-height: 18;
+        commands: "M 0 0 L 16 9 L 0 18 Z";
+        x: (parent.width - self.width) / 2 + 2px;
+        y: (parent.height - self.height) / 2;
+        fill: root.enabled ? #ffffff : rgba(255, 255, 255, 0.45);
+    }
+    if root.circle && root.icon-kind == 1: Rectangle {
+        width: 15px;
+        height: 15px;
+        border-radius: 2px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        background: root.enabled ? rgba(255, 255, 255, 0.85) : rgba(255, 255, 255, 0.45);
+    }
+    if !root.circle: Text {
+        width: parent.width;
+        height: parent.height;
+        text: root.text;
+        // «Т» мокапа: включённая — белая буква на glass-strong,
+        // выключенная — приглушённая (.gbtn.t color .35).
+        color: root.strong ? #ffffff : rgba(255, 255, 255, 0.35);
+        font-size: 18px;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+// Переключатель эфиров (change add-station-switcher): стеклянная
+// дорожка из двух сегментов над карточкой обложки. Активный эфир
+// выделен светлой заливкой; клик всегда уходит в Rust — no-op по
+// активному гасится там же (спека player-ui «Переключатель эфиров»).
+component StationSwitcher inherits Rectangle {
+    in property <[string]> station-names;
+    in property <int> station-index;
+    callback switch-station(int);
+
+    height: 34px;
+    border-radius: 10px;
+    background: rgba(12, 14, 17, 0.5);
+    border-width: 1px;
+    border-color: rgba(255, 255, 255, 0.14);
+
     HorizontalLayout {
-        x: 0;
-        y: 0;
-        width: 100%;
-        height: 100%;
-        alignment: center;
-        spacing: root.gap;
+        x: 3px;
+        y: 3px;
+        width: parent.width - 6px;
+        height: parent.height - 6px;
+        spacing: 4px;
 
-        // Обёртка-центровка: HorizontalLayout растягивает детей по
-        // вертикали — иконка исказилась бы без VerticalLayout. Условие
-        // стоит на ребёнке layout'а, а не на иконке внутри обёртки:
-        // пустой ребёнок всё равно занимает слот и spacing — буква «Т»
-        // у квадратной кнопки уезжала на полшага вправо (находка
-        // приёмки 5.3).
-        if root.icon-kind == 0 && !root.square: VerticalLayout {
-            alignment: center;
+        for name[idx] in root.station-names: Rectangle {
+            // Равные доли независимо от длины имён (мокап: flex 1).
+            // Явная ширина обязательна: stretch делит только ИЗБЫТОК
+            // поверх preferred, а preferred у сегментов — от текста,
+            // и половины выходили разными («кнопки разной ширины»,
+            // приёмка switcher).
+            width: (parent.width - (root.station-names.length - 1)
+                * parent.spacing) / root.station-names.length;
+            border-radius: 7px;
+            background: root.station-index == idx ? rgba(255, 255, 255, 0.2) : transparent;
 
-            Path {
-                width: 13px;
-                height: 15px;
-                viewbox-width: 13;
-                viewbox-height: 15;
-                commands: "M 0 0 L 13 7.5 L 0 15 Z";
-                fill: root.strong ? #14161d : #ffffff;
+            TouchArea {
+                clicked => { root.switch-station(idx); }
             }
-        }
-        if root.icon-kind == 1 && !root.square: VerticalLayout {
-            alignment: center;
-
-            Rectangle {
-                width: 12px;
-                height: 12px;
-                border-radius: 2px;
-                background: root.strong ? #14161d : #ffffff;
+            Text {
+                text: name;
+                width: parent.width;
+                color: root.station-index == idx ? #ffffff : rgba(255, 255, 255, 0.62);
+                // 13px/700: начертание 600 у рендерера спадает в тонкое
+                // и сегмент читался легче мокапа («шрифт не увеличен»,
+                // приёмка switcher).
+                font-size: 13px;
+                font-weight: 700;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                overflow: elide;
             }
-        }
-
-        label := Text {
-            text: root.text;
-            color: root.strong ? #14161d : #ffffff;
-            font-size: 15px;
-            font-weight: root.strong ? 700 : 400;
-            vertical-alignment: center;
         }
     }
 }
@@ -205,6 +257,17 @@ export component PlayerWindow inherits Window {
     callback stop();
     callback toggle-panel();
 
+    // Переключатель эфиров (change add-station-switcher): имена двух
+    // встроенных эфиров пишет Rust из константы; активный индекс —
+    // текущий выбор (-1 — пользовательский URL запуска, без выделения).
+    in property <[string]> station-names;
+    in-out property <int> station-index: -1;
+    callback switch-station(int);
+    // Цвет свечения фона по активному эфиру (мокап A): янтарный/синий;
+    // плавный переход при переключении.
+    property <color> station-tint: root.station-index == 1 ? #1c3f6e : #6b4a1e;
+    animate station-tint { duration: 250ms; }
+
     // Заголовок окна — живое имя станции из icy-name (спека player-ui:
     // в окне оно видно только здесь и в заглушке трек-строки); до его
     // получения и у станций без icy-name — имя приложения (находка
@@ -217,21 +280,49 @@ export component PlayerWindow inherits Window {
     // (герб Севастополя, design D6 add-tray).
     icon: @image-url("app-icon.png");
     // Фиксированный кадр (спека player-ui «Фиксированный размер окна» в
-    // редакции add-lyrics-panel): размер задаётся состоянием панели,
+    // редакции add-station-switcher): размер задаётся состоянием панели,
     // пользовательский ресайз запрещён в обоих состояниях (min = max =
-    // preferred). Композиция рассчитана на два кадра; расширение и
+    // preferred). Высота 600: полоса статуса и переключателя эфиров над
+    // карточкой 350×350 (мокап A реальных пропорций). Расширение и
     // сжатие — при открытии/закрытии панели, без перезапуска.
     preferred-width: root.panel-open ? 880px : 440px;
-    preferred-height: 560px;
+    preferred-height: 600px;
     min-width: root.panel-open ? 880px : 440px;
     max-width: root.panel-open ? 880px : 440px;
-    min-height: 560px;
-    max-height: 560px;
+    min-height: 600px;
+    max-height: 600px;
     background: #0b0d13;
 
-    // Слои композиции (design D2, уточнение «Карточка» ручной приёмки):
-    // тёмная подложка → карточка обложки → градиент → контент. Композиция
-    // всегда живёт в левой 440-полосе (add-lyrics-panel): кламп к 440, а
+    // Свечение эфира (мокап A, .win::before) — ЕДИНАЯ тёплая шапка на
+    // ВСЁ окно, та же формула, что была у левой колонки (180deg, tint
+    // 0% → transparent 62%). На кадре 440 совпадает с прежней колонкой
+    // пиксель-в-пиксель; на 880 шапка продолжается и на панель текста —
+    // половины читаются одним окном (приёмка: «градиент на окне текста
+    // не совпадает с градиентом основного окна»: .72-стекло панели и
+    // локальный перелив давали чёрную половину рядом с синей).
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        background: @linear-gradient(180deg, root.station-tint 0%, transparent 62%);
+    }
+    // Затемнение к низу поверх свечения (мокап, .win::after) — тоже на
+    // всю ширину: низ панели темнеет так же, как низ левой половины.
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        background: @linear-gradient(180deg,
+            rgba(16, 18, 22, 0.18) 0%,
+            rgba(16, 18, 22, 0.55) 58%,
+            rgba(16, 18, 22, 0.94) 100%);
+    }
+
+    // Колонка контента (design D2, уточнение «Карточка» ручной
+    // приёмки). Композиция всегда живёт в левой 440-полосе
+    // (add-lyrics-panel): кламп к 440, а
     // не ветка «panel-open ? 440 : root.width» — иначе при закрытии панели
     // состав растягивается на ещё не сжатое окно (880) и сжимается следом:
     // двойная перекомпоновка = видимое дёрганье (находка приёмки 5.3;
@@ -242,87 +333,25 @@ export component PlayerWindow inherits Window {
         width: min(root.width, 440px);
         height: root.height;
 
-        // Обложка-карточка по центру: 350×350, скругление через clip
-        // (у Image нет border-radius), cover — края режутся минимально;
-        // заглушка-герб той же карточкой. Мокап «Карточка»: центр на
-        // трети высоты окна.
-        Rectangle {
-            width: 350px;
-            height: 350px;
-            x: (parent.width - self.width) / 2;
-            y: root.height * 0.34 - self.height / 2;
-            border-radius: 16px;
-            clip: true;
-            // drop-shadow снят: в slint 1.19 software-рендерер впервые
-            // отливает тени и lint требует для этого background/border,
-            // но в 1.18 (принятый вид v0.1.8) тень этим рендерером
-            // не рисовалась вовсе — свойства были мёртвыми.
-
-            Image {
-                width: 100%;
-                height: 100%;
-                source: root.cover;
-                image-fit: ImageFit.cover;
-            }
-
-            // Ватермарк источника (design D5 add-cover-source-watermark,
-            // спека player-ui «Ватермарк источника обложки»): условная
-            // плашка в правом верхнем углу карточки с отступом 8px.
-            // Фон — тот же тёмный тон rgba(11, 13, 19), что у окна и
-            // градиента (единая палитра), полупрозрачный — читаем на
-            // любых обложках, в отличие от голого текста с тенью.
-            // Ширина — от естественной ширины текста: имя сервиса любой
-            // длины. Без явной width элемент в Slint занимает 100%
-            // родителя — плашка растягивалась на всю карточку (находка
-            // ручной приёмки 4.2). Внутренние поля 8px по бокам.
-            if root.cover-source != "": Rectangle {
-                x: parent.width - self.width - 8px;
-                y: 8px;
-                height: 21px;
-                width: chip-text.preferred-width + 16px;
-                border-radius: 8px;
-                background: rgba(11, 13, 19, 0.6);
-
-                chip-text := Text {
-                    x: 8px;
-                    width: parent.width - 16px;
-                    vertical-alignment: center;
-                    color: white;
-                    font-size: 12px;
-                    text: root.cover-source;
-                }
-            }
-        }
-
-        // Градиент-затемнение нижней части: читаемость текста на
-        // светлых обложках.
-        Rectangle {
-            x: 0;
-            y: parent.height * 0.40;
-            width: parent.width;
-            height: parent.height * 0.60;
-            background: @linear-gradient(180deg,
-                rgba(11, 13, 19, 0.0) 0%,
-                rgba(11, 13, 19, 0.34) 45%,
-                rgba(11, 13, 19, 0.86) 65%,
-                #0b0d13 100%);
-        }
-
-        // Контент: спейсер прижимает блок к низу, всё по центру.
+        // Контент: колонка утверждённого мокапа A (change
+        // add-station-switcher) — статус с точкой сверху, под ним
+        // переключатель эфиров, карточка обложки 350×350 в центре
+        // колонки, под ней трек-строка, внизу транспорт. Высоты сходятся
+        // в кадр 600: 20+34+350+52+64 + 4 зазора по 10 + поля 2×20.
         VerticalLayout {
             x: 0;
             y: 0;
             width: parent.width;
             height: parent.height;
-            padding: 26px;
-            spacing: 12px;
-
-            Rectangle { vertical-stretch: 1; }
+            padding: 20px;
+            spacing: 10px;
 
             // Статус: точка цвета состояния (красная — при видимой
-            // ошибке сессии, design D3) и лейбл.
+            // ошибке сессии, design D3) и лейбл. По левому краю —
+            // композиция утверждённого мокапа A (change
+            // add-station-switcher); по умолчанию layout тянет детей
+            // влево, явной центровки больше нет.
             HorizontalLayout {
-                alignment: center;
                 spacing: 8px;
 
                 VerticalLayout {
@@ -352,85 +381,169 @@ export component PlayerWindow inherits Window {
                 }
             }
 
-            // Главная строка «что сейчас в эфире» (design D5): трек —
-            // артист капсом (Rust пишет uppercase) и название крупно;
-            // сырой StreamTitle и заглушка-станция — одна строка (Rust
-            // кладёт станцию в track-title, отдельной ветки не нужно —
-            // находка ревью hunter: пустой Text резервировал высоту
-            // строки, статус прыгал при появлении станции).
-            if root.artist != "": MarqueeText {
-                text: root.artist;
-                text-color: rgba(255, 255, 255, 0.62);
-                text-font-size: 13px;
-                text-font-weight: 500;
-                text-letter-spacing: 1.2px;
-            }
-            if root.track-title != "": MarqueeText {
-                text: root.track-title;
-                text-color: #ffffff;
-                text-font-size: 25px;
-                text-font-weight: 700;
+            // Переключатель эфиров (change add-station-switcher):
+            // дорожка из двух сегментов; клик всегда уходит в Rust,
+            // no-op по активному гасится там же.
+            StationSwitcher {
+                station-names: root.station-names;
+                station-index: root.station-index;
+                switch-station(idx) => { root.switch-station(idx); }
             }
 
-            // Ошибка сессии (фатальная): стеклянная красная плашка до
-            // следующего «Играть» (сброс — в command_play). Только в
-            // паре со статусом «Остановлено» — см. точку выше.
-            if root.error != "" && root.status-kind == StatusKind.stopped: HorizontalLayout {
+            // Карточка обложки: 350×350, скругление через clip (у Image
+            // нет border-radius), cover — края режутся минимально;
+            // заглушка-герб той же карточкой. Обёртка с stretch 1: карман
+            // в пару пикселей от неточных метрик шрифта уходит в неё,
+            // не двигая остальные строки.
+            HorizontalLayout {
                 alignment: center;
+                vertical-stretch: 1;
 
                 Rectangle {
-                    height: 40px;
-                    width: min(error-text.preferred-width + 26px,
-                        parent.width);
-                    border-radius: 10px;
-                    background: rgba(214, 54, 80, 0.22);
-                    border-width: 1px;
-                    border-color: rgba(255, 122, 142, 0.38);
+                    width: 350px;
+                    height: 350px;
+                    border-radius: 16px;
+                    clip: true;
 
-                    error-text := Text {
-                        x: 13px;
-                        width: parent.width - 26px;
-                        y: (parent.height - self.height) / 2;
-                        text: root.error;
-                        color: #ffb9c6;
-                        font-size: 13px;
-                        overflow: elide;
+                    Image {
+                        width: 100%;
+                        height: 100%;
+                        source: root.cover;
+                        image-fit: ImageFit.cover;
+                    }
+
+                    // Ватермарк источника (design D5
+                    // add-cover-source-watermark, спека player-ui
+                    // «Ватермарк источника обложки»): плашка в правом
+                    // верхнем углу карточки; ширина — от естественной
+                    // ширины текста (без явной width элемент занимает 100%
+                    // родителя — находка ручной приёмки 4.2).
+                    if root.cover-source != "": Rectangle {
+                        x: parent.width - self.width - 8px;
+                        y: 8px;
+                        height: 21px;
+                        width: chip-text.preferred-width + 16px;
+                        border-radius: 8px;
+                        background: rgba(11, 13, 19, 0.6);
+
+                        chip-text := Text {
+                            x: 8px;
+                            width: parent.width - 16px;
+                            vertical-alignment: center;
+                            color: white;
+                            font-size: 12px;
+                            text: root.cover-source;
+                        }
                     }
                 }
             }
 
-            // Управление: «Играть», «Стоп» и «Т» (add-lyrics-panel);
-            // strong — доступная кнопка (гейты взаимоисключающие).
-            // «Т» активна только при найденном тексте; светлая — когда
-            // панель открыта (состояние-переключатель, крестика в панели
-            // нет — закрытие только повторным «Т»).
+            // Главная строка «что сейчас в эфире» (design D5) в слоте
+            // фиксированной высоты: появление и пропадание трека не
+            // двигают композицию (урок находки ревью hunter — пустой
+            // Text резервировал высоту, статус прыгал). Трек — артист
+            // капсом (Rust пишет uppercase) и название крупно; сырой
+            // StreamTitle и заглушка-станция — одна строка (Rust кладёт
+            // станцию в track-title, отдельной ветки не нужно).
+            // Ошибка сессии (фатальная) — на месте трек-строки: они не
+            // видны вместе (ошибка — «Остановлено», трек погашен),
+            // красная плашка до следующего «Играть» (сброс — в
+            // command_play).
+            Rectangle {
+                height: 52px;
+
+                VerticalLayout {
+                    x: 0;
+                    y: 0;
+                    width: parent.width;
+                    height: parent.height;
+                    spacing: 5px;
+
+                    if root.artist != "": MarqueeText {
+                        text: root.artist;
+                        text-color: rgba(255, 255, 255, 0.62);
+                        text-font-size: 13px;
+                        text-font-weight: 500;
+                        text-letter-spacing: 1.2px;
+                    }
+                    if root.track-title != "": MarqueeText {
+                        text: root.track-title;
+                        text-color: #ffffff;
+                        text-font-size: 25px;
+                        text-font-weight: 700;
+                    }
+                }
+
+                if root.error != "" && root.status-kind == StatusKind.stopped: HorizontalLayout {
+                    x: 0;
+                    y: 0;
+                    width: parent.width;
+                    height: parent.height;
+                    alignment: center;
+
+                    Rectangle {
+                        height: 40px;
+                        width: min(error-text.preferred-width + 26px,
+                            parent.width);
+                        border-radius: 10px;
+                        background: rgba(214, 54, 80, 0.22);
+                        border-width: 1px;
+                        border-color: rgba(255, 122, 142, 0.38);
+
+                        error-text := Text {
+                            x: 13px;
+                            width: parent.width - 26px;
+                            y: (parent.height - self.height) / 2;
+                            text: root.error;
+                            color: #ffb9c6;
+                            font-size: 13px;
+                            overflow: elide;
+                        }
+                    }
+                }
+            }
+
+            // Управление (мокап A): «Играть» и «Стоп» — круглые иконки,
+            // «Т» — скруглённый квадрат (add-lyrics-panel); strong —
+            // доступная кнопка (гейты взаимоисключающие). «Т» активна
+            // только при найденном тексте; состояние панели на вид
+            // кнопки не влияет (правка приёмки 5.3).
             HorizontalLayout {
                 alignment: center;
                 spacing: 12px;
 
                 GlassButton {
-                    text: "Играть";
                     icon-kind: 0;
+                    circle: true;
                     strong: root.can-play;
                     enabled: root.can-play;
                     clicked => { root.play(); }
                 }
                 GlassButton {
-                    text: "Стоп";
                     icon-kind: 1;
+                    circle: true;
                     strong: root.can-stop;
                     enabled: root.can-stop;
                     clicked => { root.stop(); }
                 }
-                GlassButton {
-                    text: "Т";
-                    square: true;
-                    // Светлая заливка = «текст есть» (конвенция «Играть»:
-                    // strong от enabled), буква — тёмная; состояние панели
-                    // на вид кнопки не влияет (правка приёмки 5.3).
-                    strong: root.can-lyrics;
-                    enabled: root.can-lyrics;
-                    clicked => { root.toggle-panel(); }
+                // Обёртка-центровка по вертикали: HorizontalLayout ставит
+                // детей с фиксированной высотой у ВЕРХНЕГО края ряда
+                // (замер приёмки switcher: «Т» на ~10px выше кругов).
+                // Обёртка растягивается на высоту ряда и центрирует
+                // кнопку 44px.
+                VerticalLayout {
+                    alignment: center;
+
+                    GlassButton {
+                        text: "Т";
+                        square: true;
+                        // Плотное стекло = «текст есть» (конвенция
+                        // strong от enabled); состояние панели на вид
+                        // кнопки не влияет (правка приёмки 5.3).
+                        strong: root.can-lyrics;
+                        enabled: root.can-lyrics;
+                        clicked => { root.toggle-panel(); }
+                    }
                 }
             }
         }
@@ -438,17 +551,18 @@ export component PlayerWindow inherits Window {
 
     // Панель текста песни (change add-lyrics-panel, спека player-ui
     // «Панель текста песни»): правая половина расширенного кадра —
-    // однотонная тёмная подложка, шапка с плашкой источника, строка
-    // трека и сплошной текст со скроллом. Кнопки закрытия нет:
-    // закрытие — только повторным «Т» (спека «Кнопка „Т" текста песни»).
+    // шапка с плашкой источника, строка трека и сплошной текст со
+    // скроллом. Кнопки закрытия нет: закрытие — только повторным «Т»
+    // (спека «Кнопка „Т" текста песни»). Подложки и рамки нет (раунд 8
+    // приёмки switcher: «градиент на окне текста не совпадает с
+    // основным окном» — .72-стекло и локальный перелив читались чёрной
+    // половиной рядом с цветной): панель — прозрачное продолжение общих
+    // слоёв окна, шапка свечения и затемнение идут через неё без шва.
     if root.panel-open: Rectangle {
         x: 440px;
         y: 0;
         width: root.width - 440px;
         height: root.height;
-        background: #10131c;
-        border-width: 1px;
-        border-color: rgba(255, 255, 255, 0.08);
 
         VerticalLayout {
             padding: 20px;
@@ -504,22 +618,20 @@ export component PlayerWindow inherits Window {
                 wrap: word-wrap;
             }
 
-            // Сплошной текст со скроллом, когда не влезает (спека
-            // «Прокрутка длинного текста»); пустое содержимое — пустой
-            // просмотрщик: текст скрыт при поиске нового трека (спека
-            // «Смена трека при открытой панели»). Два биндинга обязательны
-            // (находка приёмки 5.3, паттерн textedit-base из std-widgets):
-            // ширина текста = видимая ширина вьюпорта (перенос строк), и
-            // явная content-height = высота переносного layout'а — иначе
-            // Flickable растягивает ребёнка до вьюпорта, запас прокрутки
-            // нулевой и полоса не появляется вовсе.
+            // Прокрутка текста колесом и перетаскиванием БЕЗ видимой
+            // полосы: у ScrollView есть штатный выключатель полосы
+            // (vertical-scrollbar-policy: always-off) — попытка заменить
+            // виджет голым Flickable умерла дважды: сначала диапазон
+            // прокрутки (content-height — свойство самого Flickable,
+            // дефолт считает только layout-детей; Text не layout —
+            // листать было нечего), затем живое мерцание при прокрутке
+            // (приёмка switcher). Возврат к проверенному с 0.1.8
+            // паттерну двух биндингов + policy.
             lyrics-scroll := ScrollView {
                 vertical-stretch: 1;
-                content-height: max(self.visible-height, lyrics-text.preferred-height);
-                // Прокрутка перетаскиванием (просьба приёмки 5.3): виджет
-                // по умолчанию глушит drag-pan — только колесо; зажать
-                // кнопку на тексте и тянуть тоже должно скроллить.
+                vertical-scrollbar-policy: ScrollBarPolicy.always-off;
                 mouse-drag-pan-enabled: true;
+                content-height: max(self.visible-height, lyrics-text.preferred-height);
 
                 lyrics-text := Text {
                     width: lyrics-scroll.visible-width;
