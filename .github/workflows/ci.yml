@@ -8,12 +8,16 @@ name: CI
 # Теги не дублируют CI: с фильтром по branches push тегов не матчится
 # вовсе, релизные теги обслуживает Release на том же коммите.
 # workflow_dispatch — ручной запуск из Actions (например, после правки
-# воркфлоу или для прогона без нового коммита).
+# воркфлоу или для прогона без нового коммита). Еженедельный cron —
+# advisory-база RustSec меняется ежедневно: по пушам она ловит только
+# момент пула, расписание держит окно уязвимостей в пределах недели.
 on:
   push:
     branches: ['**']
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: '30 4 * * 1'
 
 permissions:
   contents: read
@@ -88,3 +92,25 @@ jobs:
           shared-key: windows-release
       - name: Release-сборка
         run: cargo build --release
+
+  security:
+    name: audit + deny (уязвимости и лицензии)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      # Инструменты security-ворот запины тем же путём, что cargo-nextest
+      # (supply chain: находка ревью 2026-11-04). taiki-e качает готовые
+      # бинари с контрольными суммами — сборка из исходников не нужна.
+      - name: Установка cargo-audit и cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit@0.22.2,cargo-deny@0.21.0
+      # Уязвимости RustSec фейлят прогон; unmaintained-транзитивы дают
+      # предупреждения (аудит) и гейтируются в deny через ignore-записи
+      # с reason в deny.toml. База advisory-db клонируется с github.
+      - name: cargo audit (RustSec)
+        run: cargo audit
+      - name: cargo deny (лицензии, bans, sources)
+        run: cargo deny check

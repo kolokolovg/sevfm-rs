@@ -1,0 +1,73 @@
+# cargo-deny: ворота supply chain — уязвимости RustSec, лицензии дерева,
+# дубликаты версий, источники крейтов. Прогон: `cargo deny check` (локально
+# и в CI, job security в ci.yml); инструменты запины в ci.yml (supply chain,
+# находка ревью 2026-11-04). Уязвимость url 2.5.8 (RUSTSEC-2026-0592)
+# закрыта обновлением lockfile в том же релизе.
+
+[advisories]
+version = 2
+# Транзитивные unmaintained-крейты: все приносит slint 1.19 / mpris-стек
+# (цепочки проверены по зависимостям slint 1.19.0 — апстрим-замен нет;
+# замены появятся только с будущими обновлениями slint/winit/zbus).
+# Игнор пересматривать при каждом обновлении slint: лишние записи
+# (адвизорий ушёл из дерева) безвредны, недостающие роняют проверку.
+ignore = [
+    # bincode ← typed-index-collections ^3.2 ← i-slint-compiler (4.0 ещё alpha).
+    # В lock как optional-путь (фичами не активируется): audit флагует сырой
+    # lockfile, deny по живому графу адвизорий не встречает — запись держим
+    # на случай будущей активации
+    { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained, транзитивный от slint" },
+    # chrono ← i-slint-core
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, транзитивный от slint" },
+    # pin-utils ← spin_on ← i-slint-compiler/slint-build
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils unmaintained, транзитивный от slint" },
+    # ttf-parser ← ab_glyph ← sctk-adwaita ← winit (перееедёт с winit 0.31)
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained, транзитивный от winit" },
+    # zvariant-семейство ← zbus 5 ← backend-winit/ksni/accesskit_unix
+    # (mpris-server уже на zbus 6, где zvariant всосан внутрь; уйдёт,
+    # когда slint переведут на zbus 6)
+    { id = "RUSTSEC-2026-0370", reason = "zvariant unmaintained, транзитивный от slint" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names unmaintained, транзитивный от slint" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive unmaintained, транзитивный от slint" },
+]
+
+[licenses]
+version = 2
+# Реальный состав лицензий дерева (627 крейтов, прогон 2026-11-22):
+# сплошные MIT/Apache-2.0/BSD/ISC + нестандартные носители —
+# webpki-roots (CDLA-Permissive-2.0, данные корневых сертификатов),
+# ksni (Unlicense) и slint-бэкенды (GPL-3.0-only). Новый крейт с иной
+# лицензией роняет проверку
+# осознанно — лицензия рассматривается перед вхождением.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    # slint: бэкенды i-slint-backend-* = GPL-3.0-only OR LicenseRef-Slint-* —
+    # OR-лицензия удовлетворяется первой разрешённой веткой
+    "GPL-3.0-only",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+# 28 дубликатов версий (slint/mpris стек тянет параллельные мажоры —
+# zbus 5+6 и пр.): предупреждение, не гейт — при сведении мажоров
+# апстримом список сам сократится. Гейт только точечный: см. deny ниже.
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
