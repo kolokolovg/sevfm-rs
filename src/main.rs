@@ -43,7 +43,7 @@ use sevfm::session::{PlayerSession, SessionHandle, SessionOutcome};
 use sevfm::tray::TraySnapshot;
 use sevfm::ui::{
     LyricsSlot, PlayerView, STATIONS, StatusKind as UiStatusKind, SwitchPlan, TrackSlot, UiState,
-    lyrics_slot_for_track, parse_args, station_index_for, switch_plan,
+    cycle_station, lyrics_slot_for_track, parse_args, station_index_for, switch_plan,
 };
 use sevfm::{redact_url, sanitize_multiline_display, say};
 
@@ -317,6 +317,21 @@ fn command_stop(binding: &SharedUiBinding) {
     }
 }
 
+/// Next/Previous из аплета MPRIS (change add-mpris-station-cycling):
+/// кольцевой шаг от текущего эфира и тот же хендлер, что у сегмента
+/// окна, — одна политика переключения на оба источника.
+fn command_cycle_station(binding: &SharedUiBinding, window: &PlayerWindow, dir: i32) {
+    let current = station_index_for(
+        binding
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .url
+            .as_str(),
+    );
+    let target = cycle_station(current, dir, STATIONS.len());
+    command_switch_station(binding, window, target);
+}
+
 /// Имя встроенного эфира для титула и заглушки до icy-name (change
 /// add-station-switcher): пользовательский URL — пусто (fallback
 /// разметки).
@@ -436,6 +451,8 @@ enum UiCommand {
     PlayPause,
     Raise,
     Quit,
+    NextStation,
+    PreviousStation,
 }
 
 #[cfg(target_os = "linux")]
@@ -450,6 +467,8 @@ impl UiCommand {
                 let _ = window.show();
             }
             UiCommand::Quit => command_quit(),
+            UiCommand::NextStation => command_cycle_station(binding, window, 1),
+            UiCommand::PreviousStation => command_cycle_station(binding, window, -1),
         }
     }
 }
@@ -899,6 +918,8 @@ fn run_ui(binding: &SharedUiBinding, process_stop: &Arc<AtomicBool>) -> i32 {
                 MprisCommand::PlayPause => UiCommand::PlayPause,
                 MprisCommand::Raise => UiCommand::Raise,
                 MprisCommand::Quit => UiCommand::Quit,
+                MprisCommand::NextStation => UiCommand::NextStation,
+                MprisCommand::PreviousStation => UiCommand::PreviousStation,
             };
             spawn_ui_command(command, &binding, weak.clone());
         }))
@@ -939,6 +960,13 @@ fn run_ui(binding: &SharedUiBinding, process_stop: &Arc<AtomicBool>) -> i32 {
             command_switch_station(&binding, &window, requested);
         });
     }
+    // Герб-заглушка для mpris:artUrl (change add-mpris-placeholder-art):
+    // извлекается один раз при старте — тот же ассет, что рисует окно;
+    // недоступный каталог — деградация (artUrl опускается, как раньше).
+    // Только Linux: единственный потребитель — poll-такт MPRIS.
+    #[cfg(target_os = "linux")]
+    let placeholder_art =
+        sevfm::cover::ensure_placeholder_cover().map(|path| sevfm::mpris::file_uri(&path));
     // Имена эфиров — из константы (один источник правды с Rust), активный
     // индекс — по URL запуска: пользовательский URL даёт сегмент без
     // выделения (спека player-ui «Переключатель эфиров»).
@@ -1000,16 +1028,20 @@ fn run_ui(binding: &SharedUiBinding, process_stop: &Arc<AtomicBool>) -> i32 {
             }
             #[cfg(target_os = "linux")]
             if let Some(mpris) = mpris.as_ref() {
-                // artUrl — только у музыкального трека с обложкой
-                // в кеше (спека mpris); имя файла — sha256, но базовый
-                // каталог из XDG/HOME требует экранирования (находка
-                // аудита — sevfm::mpris::file_uri).
+                // artUrl зеркалит обложку окна (change
+                // add-mpris-placeholder-art): у музыкального трека —
+                // кеш-обложка, во всех состояниях заглушки (вставка,
+                // сырой StreamTitle, остановка, трек без обложки) —
+                // герб. Имя файла кеша — sha256, базовый каталог из
+                // XDG/HOME требует экранирования (находка аудита —
+                // sevfm::mpris::file_uri).
                 let art_url = match &snapshot.track {
                     TrackSlot::Track { artist, title } => {
                         sevfm::cover::cached_cover_path(artist, title)
                             .map(|path| sevfm::mpris::file_uri(&path))
+                            .or_else(|| placeholder_art.clone())
                     }
-                    _ => None,
+                    _ => placeholder_art.clone(),
                 };
                 mpris.push(mpris_service::MprisUpdate {
                     playback: sevfm::mpris::MprisPlayback::of(&snapshot),

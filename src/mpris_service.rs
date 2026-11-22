@@ -61,6 +61,10 @@ pub enum MprisCommand {
     PlayPause,
     Raise,
     Quit,
+    /// Next/Previous — переключение эфира по кольцу (change
+    /// add-mpris-station-cycling).
+    NextStation,
+    PreviousStation,
 }
 
 /// Хендл MPRIS-потока: `Send` — хранится в `run_ui`, push идёт из
@@ -94,8 +98,10 @@ impl Mpris {
                         // ручного тестирования).
                         .can_pause(true)
                         .can_seek(false)
-                        .can_go_next(false)
-                        .can_go_previous(false)
+                        // Next/Previous листают эфиры по кольцу (change
+                        // add-mpris-station-cycling).
+                        .can_go_next(true)
+                        .can_go_previous(true)
                         .playback_status(PlaybackStatus::Stopped)
                         .build()
                         .await
@@ -127,6 +133,14 @@ impl Mpris {
                     {
                         let commands = commands.clone();
                         player.connect_play_pause(move |_| commands(MprisCommand::PlayPause));
+                    }
+                    {
+                        let commands = commands.clone();
+                        player.connect_next(move |_| commands(MprisCommand::NextStation));
+                    }
+                    {
+                        let commands = commands.clone();
+                        player.connect_previous(move |_| commands(MprisCommand::PreviousStation));
                     }
                     {
                         let commands = commands.clone();

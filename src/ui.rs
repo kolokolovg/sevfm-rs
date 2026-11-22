@@ -344,6 +344,17 @@ pub fn switch_plan(active: i32, requested: i32, session_running: bool) -> Switch
     }
 }
 
+/// Целевой эфир для MPRIS Next/Previous (change
+/// add-mpris-station-cycling): шаг по кольцу от активного индекса;
+/// пользовательский URL (`-1`) — Next ведёт в первый эфир, Previous —
+/// в последний. `rem_euclid` страхует отрицательные шаги кольца.
+pub fn cycle_station(current: i32, dir: i32, len: usize) -> i32 {
+    if current < 0 {
+        return if dir > 0 { 0 } else { len as i32 - 1 };
+    }
+    (current + dir).rem_euclid(len as i32)
+}
+
 /// Разбор аргументов командной строки (design D6, без clap): флаг
 /// `--headless` в любой позиции, первый позиционный аргумент — URL.
 /// Ошибки — неизвестный флаг, повторный `--headless`, лишний
@@ -942,5 +953,20 @@ mod tests {
         // путь, повторный выбор «ничего» — no-op.
         assert_eq!(switch_plan(-1, 0, true), StopAndAutoPlay);
         assert_eq!(switch_plan(-1, -1, true), Noop);
+    }
+
+    /// Кольцо эфиров для MPRIS Next/Previous (change
+    /// add-mpris-station-cycling): шаг с заворачиванием в обе стороны;
+    /// от пользовательского URL (-1) — в первый или последний.
+    #[test]
+    fn cycle_station_wraps_ring() {
+        let len = STATIONS.len();
+        assert_eq!(cycle_station(0, 1, len), 1);
+        assert_eq!(cycle_station(1, 1, len), 0);
+        assert_eq!(cycle_station(1, -1, len), 0);
+        assert_eq!(cycle_station(0, -1, len), 1);
+        // Пользовательский URL: Next — в первый, Previous — в последний.
+        assert_eq!(cycle_station(-1, 1, len), 0);
+        assert_eq!(cycle_station(-1, -1, len), len as i32 - 1);
     }
 }
