@@ -263,7 +263,7 @@ fn fetch_lyrics(
         status => {
             return Err(LyricsError::Network(format!(
                 "точный запрос: HTTP {status}"
-            )))
+            )));
         }
     };
     if exact.is_some() {
