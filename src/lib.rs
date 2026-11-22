@@ -72,6 +72,23 @@ pub fn sanitize_display(text: &str) -> std::borrow::Cow<'_, str> {
     )
 }
 
+/// Многострочный вариант [`sanitize_display`] для текста песни: переводы
+/// строк — структурные символы (plainLyrics LrcLib делит строки `\n`),
+/// они сохраняются; `\r\n` и одиночный `\r` нормализуются к `\n`. Всё
+/// прочее, что гасит однострочный вариант (управляющие и bidi-символы),
+/// заменяется построчно. Существование отдельной функции — находка приёмки
+/// релиза 0.1.8: применение однострочного [`sanitize_display`] к целому
+/// тексту превращало каждый перевод строки в U+FFFD, панель показывала
+/// сплошное полотно с «ромбами» вместо строк.
+pub fn sanitize_multiline_display(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .split('\n')
+        .map(|line| sanitize_display(line).into_owned())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Сообщения для пользователя — та же очистка, что и для GUI-строк.
 fn sanitize_for_terminal(text: &str) -> std::borrow::Cow<'_, str> {
     sanitize_display(text)
@@ -122,6 +139,25 @@ mod tests {
             sanitize_for_terminal("\u{202E}подделка\u{2066}"),
             "\u{FFFD}подделка\u{FFFD}"
         );
+    }
+
+    /// Многострочный санитайзер (находка приёмки релиза 0.1.8): переводы
+    /// строк — структурные, остаются; `\r\n` и одиночный `\r`
+    /// нормализуются; bidi/управляющие гасятся построчно.
+    #[test]
+    fn sanitize_multiline_preserves_newlines_kills_hostile_per_line() {
+        // Переводы строк остаются на месте, CRLF нормализуется.
+        assert_eq!(
+            sanitize_multiline_display("строка первая\nстрока вторая\r\nтретья"),
+            "строка первая\nстрока вторая\nтретья"
+        );
+        // Bidi и ESC гасятся внутри строк, `\n` между ними живёт.
+        assert_eq!(
+            sanitize_multiline_display("a\u{202E}b\nc\x1bd"),
+            "a\u{FFFD}b\nc\u{FFFD}d"
+        );
+        // Одиночный `\r` — тоже разделитель строк, не U+FFFD.
+        assert_eq!(sanitize_multiline_display("левая\rправая"), "левая\nправая");
     }
 
     /// Userinfo вырезается; `@` в пути и URL без userinfo — без изменений.

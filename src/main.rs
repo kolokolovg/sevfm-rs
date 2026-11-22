@@ -45,7 +45,7 @@ use sevfm::ui::{
     LyricsSlot, PlayerView, StatusKind as UiStatusKind, TrackSlot, UiState, lyrics_slot_for_track,
     parse_args,
 };
-use sevfm::{redact_url, sanitize_display, say};
+use sevfm::{redact_url, sanitize_multiline_display, say};
 
 slint::include_modules!();
 
@@ -254,7 +254,7 @@ fn set_lyrics_view(ui: &mut UiBinding, window: &PlayerWindow, slot: &LyricsSlot)
             // находка security-ревью): bidi/управляющие символы из ответа
             // LrcLib не должны переупорядочивать строки панели — симметрия
             // с тултипом трея и метаданными MPRIS.
-            window.set_lyrics(sanitize_display(text).into_owned().into());
+            window.set_lyrics(sanitize_multiline_display(text).into());
             // Плашка источника — строго вместе с текстом: иначе при смене
             // трека имя прошлого источника «залипло» бы (симметрия пары
             // обложка/источник design D6 add-cover-source-watermark).
