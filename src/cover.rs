@@ -588,6 +588,43 @@ pub fn cached_cover_path(artist: &str, title: &str) -> Option<std::path::PathBuf
     file.is_file().then_some(file)
 }
 
+/// Байты герба-заглушки (change add-mpris-placeholder-art) — тот же
+/// ассет-файл, что сборка Slint вшивает в окно: один источник правды.
+const PLACEHOLDER_COVER_PNG: &[u8] = include_bytes!("../ui/cover-placeholder.png");
+
+/// Путь герба-заглушки: рядом с каталогом `covers` (change
+/// add-mpris-placeholder-art), чтобы `--clear-cache`, очищающий кеш
+/// обложек, герб не стирал.
+fn placeholder_cover_path_in(app_cache: &std::path::Path) -> std::path::PathBuf {
+    app_cache.join("cover-placeholder.png")
+}
+
+/// Запись герба-заглушки в файл (change add-mpris-placeholder-art) —
+/// чистая функция для теста.
+fn extract_placeholder_cover(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::write(path, PLACEHOLDER_COVER_PNG)
+}
+
+/// Извлечь герб-заглушку в каталог кеша и вернуть путь (change
+/// add-mpris-placeholder-art: `mpris:artUrl` для состояний заглушки —
+/// тот же герб, что показывает окно). Запись при каждом старте —
+/// самовосстановление после ручных чисток; каталог кеша не определён
+/// или запись не удалась — None (деградация: artUrl опускается).
+pub fn ensure_placeholder_cover() -> Option<std::path::PathBuf> {
+    let app_cache = cache_dir()?.parent()?.to_path_buf();
+    // Каталог `<cache>/sevfm` воркер обложек создаёт лениво, при первой
+    // найденной картинке: на чистой машине к старту его ещё нет —
+    // создаём (ошибка не разворачивается: недоступный каталог проявится
+    // отказом записи ниже, деградация та же).
+    let _ = std::fs::create_dir_all(&app_cache);
+    let path = placeholder_cover_path_in(&app_cache);
+    if let Err(e) = extract_placeholder_cover(&path) {
+        crate::say(&format!("не удалось извлечь герб-заглушку: {e}"));
+        return None;
+    }
+    Some(path)
+}
+
 /// Источник из sidecar кеша (design D2 add-cover-source-watermark):
 /// читается только обычный файл не больше [`SIDECAR_LIMIT_BYTES`] —
 /// `symlink_metadata` не следует по ссылке (паттерн `touch_last_used`),
@@ -1426,6 +1463,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("каталог кеша теста создаётся");
         dir
+    }
+
+    /// Герб-заглушка (change add-mpris-placeholder-art): извлечённый
+    /// файл побайтово равен ассету окна; путь лежит в каталоге кеша
+    /// приложения, но вне `covers` — `--clear-cache` его не стирает.
+    #[test]
+    fn placeholder_cover_extracts_asset_outside_covers() {
+        let app_cache = test_cache_dir("placeholder");
+        let path = placeholder_cover_path_in(&app_cache);
+        assert!(path.starts_with(&app_cache));
+        assert!(
+            !path.to_string_lossy().contains("covers"),
+            "герб не должен жить внутри каталога covers: {path:?}"
+        );
+        extract_placeholder_cover(&path).expect("герб извлекается");
+        assert_eq!(
+            std::fs::read(&path).expect("извлечённый файл читается"),
+            PLACEHOLDER_COVER_PNG,
+            "извлечённый герб побайтово равен ассету окна"
+        );
     }
 
     /// Лимит тела (design D1 harden-network-resilience): `take(limit+1)`

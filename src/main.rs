@@ -939,13 +939,6 @@ fn run_ui(binding: &SharedUiBinding, process_stop: &Arc<AtomicBool>) -> i32 {
             command_switch_station(&binding, &window, requested);
         });
     }
-    // Герб-заглушка для mpris:artUrl (change add-mpris-placeholder-art):
-    // извлекается один раз при старте — тот же ассет, что рисует окно;
-    // недоступный каталог — деградация (artUrl опускается, как раньше).
-    // Только Linux: единственный потребитель — poll-такт MPRIS.
-    #[cfg(target_os = "linux")]
-    let placeholder_art =
-        sevfm::cover::ensure_placeholder_cover().map(|path| sevfm::mpris::file_uri(&path));
     // Имена эфиров — из константы (один источник правды с Rust), активный
     // индекс — по URL запуска: пользовательский URL даёт сегмент без
     // выделения (спека player-ui «Переключатель эфиров»).
@@ -1007,20 +1000,16 @@ fn run_ui(binding: &SharedUiBinding, process_stop: &Arc<AtomicBool>) -> i32 {
             }
             #[cfg(target_os = "linux")]
             if let Some(mpris) = mpris.as_ref() {
-                // artUrl зеркалит обложку окна (change
-                // add-mpris-placeholder-art): у музыкального трека —
-                // кеш-обложка, во всех состояниях заглушки (вставка,
-                // сырой StreamTitle, остановка, трек без обложки) —
-                // герб. Имя файла кеша — sha256, базовый каталог из
-                // XDG/HOME требует экранирования (находка аудита —
-                // sevfm::mpris::file_uri).
+                // artUrl — только у музыкального трека с обложкой
+                // в кеше (спека mpris); имя файла — sha256, но базовый
+                // каталог из XDG/HOME требует экранирования (находка
+                // аудита — sevfm::mpris::file_uri).
                 let art_url = match &snapshot.track {
                     TrackSlot::Track { artist, title } => {
                         sevfm::cover::cached_cover_path(artist, title)
                             .map(|path| sevfm::mpris::file_uri(&path))
-                            .or_else(|| placeholder_art.clone())
                     }
-                    _ => placeholder_art.clone(),
+                    _ => None,
                 };
                 mpris.push(mpris_service::MprisUpdate {
                     playback: sevfm::mpris::MprisPlayback::of(&snapshot),
