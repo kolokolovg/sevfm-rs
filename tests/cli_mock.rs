@@ -366,7 +366,11 @@ fn invalid_url_exits_with_code_2_in_both_modes() {
 #[test]
 fn icy_metadata_printed_to_stderr() {
     let fixture = common::fixture_bytes();
-    let metaint = 16 * 1024;
+    // Metaint 64 КиБ = 4 с звука фикстуры (128 кбит/с): трек держится в эфире
+    // секунды, а не одну. С 16 КиБ на голодном раннере опрос headless-печати
+    // (100 мс) не успевал до смены блока — печаталась сразу вставка, строка
+    // трека не приходила никогда (плановый прогон CI 2026-11-23).
+    let metaint = 64 * 1024;
     // Первый блок — трек, дальше вставка: обе строки обязаны появиться.
     let framed = common::icy_frame(
         &fixture[..128 * 1024],
@@ -424,7 +428,7 @@ fn icy_metadata_printed_to_stderr() {
     let mut station_at: Option<usize> = None;
     let mut track_at: Option<usize> = None;
     // Запас 60 с — не для сети (мок локален), а для перегруженного
-    // шаренного раннера: трек появляется после ~1 с звучания через ALSA
+    // шаренного раннера: трек появляется после ~4 с звучания через ALSA
     // null, и на голодном по CPU раннере путь до метаблока растягивается.
     // На зелёном прогоне стоимость нулевая — выход по успеху.
     let deadline = Instant::now() + Duration::from_secs(60);
